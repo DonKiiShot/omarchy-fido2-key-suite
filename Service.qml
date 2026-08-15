@@ -178,14 +178,6 @@ Item {
     setAuthMode("fido2")
   }
 
-  // The way out of an inert key prompt for someone who just starts typing: the
-  // first character is not thrown away, it lands in the password field.
-  function usePassword(seed) {
-    setAuthMode("password")
-    var text = String(seed || "")
-    if (text.length > 0) enteredPassword = text
-  }
-
   function setAuthMode(mode) {
     // Any deliberate choice -- by the user or by settleAuthMode -- ends the
     // auto-selection for this lock. A key plugged in later must never yank the
@@ -487,7 +479,6 @@ Item {
         onSubmitPassword: function(password) { root.submitPassword(password) }
         onSubmitFido2Pin: function(pin) { root.submitFido2Pin(pin) }
         onToggleAuthMode: root.setAuthMode(root.fido2Active ? "password" : "fido2")
-        onUsePasswordRequested: function(seed) { root.usePassword(seed) }
         onRetryFido2Requested: root.startFido2()
         onClearFailureRequested: root.failureMessage = ""
         onWakeRequested: root.runWake()

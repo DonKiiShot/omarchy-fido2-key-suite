@@ -144,10 +144,15 @@ discover that the only one you knew about does not apply:
 | Input | In password mode | In key mode |
 |---|---|---|
 | `Tab` | switch to the key | switch to the password |
-| a printable key, while the field is inert | — | switch to the password, keeping the character |
 | `Enter` on an empty field | — | retry the key |
 
 plus the pill under the field and the key glyph inside it, for the mouse.
+
+A third one was tried and taken back out: any printable key, while the field
+was inert, switching to the password and keeping the character. It reads well
+on paper and does not survive contact — waiting for a touch is exactly the
+moment a stray keystroke is most likely, and having one silently change the
+factor under you is worse than reaching for Tab.
 
 ## Part 4 — Fork drift, and what is done about it
 
@@ -278,14 +283,24 @@ Verified without hardware:
   already-correct PAM service, two `+presence+pin` credentials, no attached
   key, and a fork base current with the installed lock plugin
 
-**Not yet confirmed against the hardware**: the lock screen itself. A headless
-smoke test turned out to be impossible — `qs.Commons` cannot load outside the
-Quickshell runtime, and starting a second Quickshell instance to test a lock
-screen is worse than the thing it tests. So the UI paths (key mode by default,
-PIN then touch, `Tab`, type-to-switch, `Enter` retry, unplugged key, failed
-attempt) are covered by `qmllint` and by review, and need one pass with the key
-in hand. `omarchy-shell lock preview` shows the surface without locking, which
-is the safe first look.
+A headless smoke test turned out to be impossible — `qs.Commons` cannot load
+outside the Quickshell runtime, and starting a second Quickshell instance to
+test a lock screen is worse than the thing it tests. So the UI was checked by
+`qmllint`, by review, and then by using it.
+
+### What using it changed
+
+Two things, both found on the first real session:
+
+1. **The key glyph never appeared.** Not a layout or font problem: the `text:`
+   property was an empty string. The character had been silently dropped from
+   the source, and nothing catches that — an empty `Text` is valid QML, lints
+   clean, and renders as nothing at zero width, so even the gutter it should
+   have reserved looked correct. It is now written as the QML unicode escape
+   `"\ueb11"` rather than as the literal character — the same glyph Omarchy's
+   own menu uses for *Setup → Security → Fido2*, in a form that nothing
+   rewriting the file can quietly eat.
+2. **Type-to-switch is gone**, see above.
 
 ### Working on it
 

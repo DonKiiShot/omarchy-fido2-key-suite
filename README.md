@@ -45,7 +45,6 @@ deliberately does not enroll keys — see [Scope](#scope).
 | Input | Password mode | Key mode |
 |---|---|---|
 | `Tab` | switch to the key | switch to the password |
-| type a letter, while the key is waiting | — | switch to the password, keeping the character |
 | `Enter` on an empty field | — | try the key again |
 | the pill under the field | switch to the key | switch to the password |
 | the key glyph inside the field | switch to the key | try again |

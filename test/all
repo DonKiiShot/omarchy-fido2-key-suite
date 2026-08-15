@@ -83,6 +83,13 @@ check "the password flow never responds with the PIN buffer" bash -c '
 check "the FIDO2 PAM service is not shared with the password one" bash -c '
   ! grep -n "config: \"omarchy-lock-password\"" "$1/Service.qml" | grep -q fido2' _ "$REPO"
 
+# An empty Text is valid QML, lints clean, and draws nothing at zero width, so
+# a glyph lost in an edit leaves no trace anywhere except a lock screen with a
+# missing icon. This shipped once.
+check "the security-key glyph is not empty" bash -c '
+  grep -A 10 "objectName: \"fido2Indicator\"" "$1/LockView.qml" \
+    | grep -qE "^\s+text: \"[^\"]+\"$"' _ "$REPO"
+
 printf '\n\e[1mUpstream\e[0m\n'
 
 if [[ ! -d $OMARCHY_LOCK_DIR ]]; then

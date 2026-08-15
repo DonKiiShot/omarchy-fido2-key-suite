@@ -62,7 +62,6 @@ Item {
   signal submitFido2Pin(string pin)
   signal passwordTextEdited(string password)
   signal toggleAuthMode()
-  signal usePasswordRequested(string seed)
   signal retryFido2Requested()
   signal clearFailureRequested()
   signal wakeRequested()
@@ -234,21 +233,13 @@ Item {
           if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.retryFido2Requested()
             event.accepted = true
-            return
           }
 
-          // Anything printable means the user would rather type their password
-          // than wait for a key that is not answering. Take them there, and
-          // keep the character they already typed.
-          var printable = event.text.length === 1
-            && event.text.charCodeAt(0) >= 0x20
-            && event.text.charCodeAt(0) !== 0x7f
-            && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
-
-          if (printable) {
-            root.usePasswordRequested(event.text)
-            event.accepted = true
-          }
+          // Everything else is swallowed by readOnly. Switching to the password
+          // on any printable key was tried here and taken back out: waiting for
+          // a touch is exactly when a stray keystroke is most likely, and
+          // having one silently change the factor under you is worse than
+          // reaching for Tab.
         }
       }
 
@@ -294,7 +285,11 @@ Item {
         anchors.rightMargin: fingerprintIcon.visible ? 12 : inputField.borderRight + 18
         anchors.verticalCenter: parent.verticalCenter
         visible: root.fido2Configured
-        text: ""
+        // U+EB11, the key glyph Omarchy's own menu uses for Setup > Security >
+        // Fido2. Written as an escape rather than as the literal character: a
+        // Private Use Area codepoint survives no round trip through anything
+        // that sanitises text, and it went missing exactly that way once.
+        text: "\ueb11"
         color: root.fido2Active
           ? (root.fido2TokenPresent ? Color.lock.text : Color.lock.textError)
           : Color.lock.placeholder
