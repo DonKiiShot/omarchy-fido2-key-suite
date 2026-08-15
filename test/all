@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# Everything that can be checked without a lock screen and a human thumb.
+# Run before publishing, and after every rebase onto a newer built-in.
+
+set -uo pipefail
+
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+OMARCHY_LOCK_DIR="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/lock"
+UPSTREAM_FILES=(Service.qml LockView.qml manifest.json)
+
+PASSED=0
+FAILED=0
+SKIPPED=0
+
+pass() { printf '  \e[32m✓\e[0m %s\n' "$1"; PASSED=$((PASSED + 1)); }
+skip() { printf '  \e[2m-\e[0m %s \e[2m(skipped: %s)\e[0m\n' "$1" "$2"; SKIPPED=$((SKIPPED + 1)); }
+flunk() {
+  printf '  \e[31m✗\e[0m %s\n' "$1"
+  [[ -n ${2:-} ]] && printf '\e[2m%s\e[0m\n' "$2"
+  FAILED=$((FAILED + 1))
+}
+
+check() { # description, command...
+  local description="$1"; shift
+  local output
+  if output=$("$@" 2>&1); then pass "$description"; else flunk "$description" "$output"; fi
+}
+
+printf '\e[1mManifest\e[0m\n'
+
+check "manifest.json is valid JSON" jq -e . "$REPO/manifest.json"
+
+for field in schemaVersion id name version author description license kinds entryPoints; do
+  check "manifest has '$field'" jq -e --arg f "$field" 'has($f)' "$REPO/manifest.json"
+done
+
+check "id is not in the reserved omarchy.* namespace" \
+  jq -e '.id | startswith("omarchy.") | not' "$REPO/manifest.json"
+
+check "declares kind 'service' with an entry point" \
+  jq -e '(.kinds | index("service")) != null and (.entryPoints | has("service"))' "$REPO/manifest.json"
+
+check "replaces the built-in lock via clonedFrom" \
+  jq -e '.omarchy.clonedFrom == "omarchy.lock"' "$REPO/manifest.json"
+
+check "every entry point exists" bash -c '
+  cd "$1" || exit 1
+  while IFS= read -r entry; do [[ -f $entry ]] || { echo "missing: $entry"; exit 1; }; done \
+    < <(jq -r ".entryPoints[]" manifest.json)' _ "$REPO"
+
+printf '\n\e[1mPlugin folder\e[0m\n'
+
+if command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  check "omarchy plugin validate" omarchy-plugin-validate "$REPO"
+else
+  skip "omarchy plugin validate" "not an Omarchy machine"
+fi
+
+check "no symlinks anywhere in the folder" bash -c '
+  link=$(find "$1" -name .git -prune -o -type l -print -quit)
+  [[ -z $link ]] || { echo "symlink: $link"; exit 1; }' _ "$REPO"
+
+check "bin/omarchy-lock-fido2 parses" bash -n "$REPO/bin/omarchy-lock-fido2"
+check "bin/omarchy-lock-fido2 is executable" test -x "$REPO/bin/omarchy-lock-fido2"
+
+printf '\n\e[1mQML\e[0m\n'
+
+if command -v qmllint >/dev/null 2>&1 && [[ -d ${OMARCHY_PATH:-/usr/share/omarchy}/shell ]]; then
+  check "qmllint Service.qml LockView.qml" \
+    qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" "$REPO/Service.qml" "$REPO/LockView.qml"
+else
+  skip "qmllint" "qmllint or the Omarchy shell is not installed"
+fi
+
+# The whole point of a separate PAM service: no path may exist that sends a
+# password to the key. If the FIDO2 conversation ever borrows the password
+# buffer, that guarantee is gone.
+check "the FIDO2 flow never responds with the password buffer" bash -c '
+  ! grep -nE "fido2Pam\.respond\((pendingPassword|enteredPassword)" "$1/Service.qml"' _ "$REPO"
+check "the password flow never responds with the PIN buffer" bash -c '
+  ! grep -nE "passwordPam\.respond\(pendingFido2Pin" "$1/Service.qml"' _ "$REPO"
+check "the FIDO2 PAM service is not shared with the password one" bash -c '
+  ! grep -n "config: \"omarchy-lock-password\"" "$1/Service.qml" | grep -q fido2' _ "$REPO"
+
+printf '\n\e[1mUpstream\e[0m\n'
+
+if [[ ! -d $OMARCHY_LOCK_DIR ]]; then
+  skip "fork base matches the installed lock plugin" "$OMARCHY_LOCK_DIR not found"
+else
+  for file in "${UPSTREAM_FILES[@]}"; do
+    recorded=$(grep -oP "^sha256_$file=\K.*" "$REPO/upstream/BASE" 2>/dev/null)
+    snapshot=$(sha256sum "$REPO/upstream/$file" 2>/dev/null | cut -d' ' -f1)
+    installed=$(sha256sum "$OMARCHY_LOCK_DIR/$file" 2>/dev/null | cut -d' ' -f1)
+
+    if [[ -z $recorded || -z $snapshot ]]; then
+      flunk "upstream/$file is recorded in BASE"
+    elif [[ $recorded != "$snapshot" ]]; then
+      flunk "upstream/$file matches its hash in BASE" "recorded $recorded, file $snapshot"
+    elif [[ $recorded != "$installed" ]]; then
+      flunk "upstream/$file matches the installed lock plugin" \
+        "upstream has moved -- run: bin/omarchy-lock-fido2 rebase"
+    else
+      pass "upstream/$file is current"
+    fi
+  done
+fi
+
+printf '\n%d passed, %d failed, %d skipped\n' "$PASSED" "$FAILED" "$SKIPPED"
+(( FAILED == 0 ))

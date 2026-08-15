@@ -1,0 +1,15 @@
+# The revision of Omarchy's built-in lock plugin this fork was taken from.
+# Used by `bin/omarchy-lock-fido2 doctor` to notice when upstream has moved,
+# and by `... rebase` as the merge base for a three-way merge.
+#
+# Update both this file and the copies beside it in the same commit that
+# re-bases the fork -- they are one record, not two.
+
+omarchy_version=4.0.0.alpha
+upstream_branch=quattro
+upstream_commit=f0020448ca87329199de7cb12f2015ebc4a3e5e7
+forked_on=2026-08-15
+
+sha256_Service.qml=3f0a265a09f7957e8f5d74666595d3136ec64899c414426190460f9e2098e701
+sha256_LockView.qml=ddc05881b571c1ffc526d751a83002649d873969a2fd66297b347c152ac6111b
+sha256_manifest.json=4a0658bff8ac1cb8d428cf32e7eb05027709e2d49beed0b2482c63cca9c5b3f4
