@@ -216,7 +216,97 @@ requirement, it *is* a convenience gain: touch to unlock.
    hardware: enrolled + attached, enrolled + unplugged, not enrolled, wrong
    PIN, cancelled touch, fallback to password.
 
+## Part 7 — Publishing
+
+The distribution mechanism is the repo itself: anyone can
+`omarchy plugin add https://github.com/Erijl/omarchy-fido2-lockscreen-plugin.git`
+once it is public. Listing it at [omarchyplugins.com](https://omarchyplugins.com)
+is only so people find it.
+
+Their checklist, and where this repo answers it:
+
+| Requirement | Here |
+|---|---|
+| Public GitHub repository | `Erijl/omarchy-fido2-lockscreen-plugin` |
+| Valid `manifest.json` at the root | with `author`, `license`, `description` — all marketplace-required |
+| README and license | `README.md`, `LICENSE` (MIT, with the derived files' © intact) |
+| Safe install and removal | `omarchy plugin add` / `omarchy plugin remove`, the latter restoring `omarchy.lock` |
+| No config overwritten without consent | `shell.json` is only touched through the shell's own enable/disable; `/etc/pam.d` only by a command the user runs, which diffs before replacing |
+| Optional preview image | not yet — needs a photograph of a real lock screen |
+
+Submission is an issue form:
+[`HANCORE-linux/omarchy-plugin-marketplace` → submit-plugin.yml](https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/new?template=submit-plugin.yml).
+
+- **Repository URL:** `https://github.com/Erijl/omarchy-fido2-lockscreen-plugin`
+- **Category:** System
+- **Tags:** Security, Quickshell, System *(three is the maximum)*
+- **Maintainer notes:** Replaces the built-in `omarchy.lock` through the
+  manifest's `clonedFrom`, so enabling it disables the built-in and removing it
+  puts the built-in back. Needs `pam-u2f` and `libfido2`, and one command run
+  by hand — `bin/omarchy-lock-fido2 setup` — to write
+  `/etc/pam.d/omarchy-lock-fido2`; that is the only step that touches the
+  system, and the only one that asks for sudo. It does not enroll credentials.
+
 ## Status
 
-**Designed. Nothing built yet.** This section gets rewritten with what was
-actually built, what was verified against hardware, and what was left undone.
+**Built and installed.** Everything in Part 6 exists. The plugin was installed
+the way a downloader installs it — `omarchy plugin add <repo> --enable --yes` —
+against Omarchy 4.0.0.alpha, and the replacement mechanism behaved exactly as
+the registry source said it would:
+
+```json
+{ "plugins": [ { "id": "erijl.lock" } ],
+  "disabledPlugins": [ "omarchy.lock" ],
+  "cloneSourceRestores": [ "erijl.lock" ] }
+```
+
+`omarchy plugin list` shows `omarchy.lock disabled` and `erijl.lock enabled`,
+and `omarchy-shell lock status` is answered by this plugin — so the `lock` IPC
+target moved with the service and every existing caller (`omarchy system lock`,
+the idle daemon, the menu) reaches it unchanged.
+
+Verified without hardware:
+
+- `./test/all` — 25 checks, including `omarchy plugin validate`, `qmllint`
+  against the installed shell, and the fork-base hashes
+- the settings binding is live: adding `"defaultMode": "security-key"` to the
+  plugin's entry and calling `reloadConfig` moved `defaultMode` in
+  `lock status` without a restart
+- the split detection reports `fido2Pam` and `fido2Enrolled` separately
+- no QML errors from the shell's log after the service loaded
+- `bin/omarchy-lock-fido2 doctor` correctly reports a not-installed plugin, an
+  already-correct PAM service, two `+presence+pin` credentials, no attached
+  key, and a fork base current with the installed lock plugin
+
+**Not yet confirmed against the hardware**: the lock screen itself. A headless
+smoke test turned out to be impossible — `qs.Commons` cannot load outside the
+Quickshell runtime, and starting a second Quickshell instance to test a lock
+screen is worse than the thing it tests. So the UI paths (key mode by default,
+PIN then touch, `Tab`, type-to-switch, `Enter` retry, unplugged key, failed
+attempt) are covered by `qmllint` and by review, and need one pass with the key
+in hand. `omarchy-shell lock preview` shows the surface without locking, which
+is the safe first look.
+
+### Working on it
+
+The installed copy is a git checkout with its `origin` pointing at the
+development repo, so the edit loop is:
+
+```bash
+cd ~/gitprojects/omarchy-fido2-lockscreen-plugin
+# edit, then
+git commit -am "..."
+omarchy plugin update erijl.lock      # shows the diff, fast-forwards
+```
+
+That also exercises the same update path a downloader gets. Point `origin` at
+GitHub in the installed checkout once the repo is published, so
+`omarchy plugin update` follows the public repo instead.
+
+### Left undone, deliberately
+
+- No preview image for the marketplace listing yet; it wants a screenshot of a
+  lock screen, which has to be taken by hand.
+- Enrollment stays out of scope (Part 5), so a machine with no credential still
+  needs Omarchy's own setup command — and, on an `alwaysUv` key, the upstream
+  fix that records the right flags.
