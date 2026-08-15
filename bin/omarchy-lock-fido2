@@ -205,6 +205,7 @@ check_credentials() {
   local count=$((${#credentials[@]} - 1))
   (( count > 0 )) && ok "$count credential(s) enrolled for $USER" || bad "no credential fields for $USER"
 
+  CREDENTIALS_FOUND=$count
   CREDENTIALS_WANT_PIN=0
   local index options
   for (( index = 1; index < ${#credentials[@]}; index++ )); do
@@ -260,18 +261,29 @@ check_hardware() {
 
 check_pin_policy() {
   # The failure this plugin exists next to: a key that demands verification for
-  # every assertion, against a credential registered without any.
+  # every assertion, against a credential registered without any. Omarchy's own
+  # setup command cannot produce the right credential yet, so say what to do.
   (( ${TOKEN_ALWAYS_UV:-0} )) || return 0
   (( ${CREDENTIALS_WANT_PIN:-0} )) && return 0
 
   heading "The alwaysUv mismatch"
-  bad "an attached key enforces alwaysUv, but the enrolled credential asks for no PIN"
-  note "pam_u2f will request an assertion with verification off, the key will refuse it"
-  note "before it ever lights up, and the unlock will fail without a single blink."
+  bad "an attached key enforces alwaysUv, but no enrolled credential records a PIN"
+  note "pam_u2f asks for an assertion with verification off, the key refuses it before"
+  note "it ever lights up, and the unlock fails without a single blink."
   note ""
-  note "Re-enroll that key with PIN verification recorded on the credential:"
-  note "  pamu2fcfg -N -n | sudo tee -a $AUTHFILE"
-  note "(-N records +pin; -n appends without repeating the username field)"
+
+  if (( ${CREDENTIALS_FOUND:-0} )); then
+    note "Add a PIN-verified credential to your existing line (keeps the others):"
+    note "  cred=\$(pamu2fcfg -N -n)"
+    note "  sudo sed -i \"s|^\$USER:.*|&\$cred|\" $AUTHFILE"
+  else
+    note "Enroll with PIN verification recorded on the credential:"
+    note "  sudo mkdir -p /etc/fido2"
+    note "  pamu2fcfg -N | sudo tee -a $AUTHFILE"
+  fi
+  note ""
+  note "-N is what records +pin. Omarchy's own setup passes no flags, which is"
+  note "why a stock enrollment does not work on this key."
 }
 
 check_plugin() {
