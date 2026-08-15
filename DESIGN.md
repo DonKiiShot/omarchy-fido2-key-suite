@@ -300,6 +300,13 @@ Two things, both found on the first real session:
    `"\ueb11"` rather than as the literal character — the same glyph Omarchy's
    own menu uses for *Setup → Security → Fido2*, in a form that nothing
    rewriting the file can quietly eat.
+
+   The fix then appeared not to work, which turned out to be the hot-reload
+   limitation below rather than anything about the glyph. Both the font
+   (`fc-list ':charset=eb11'`) and QML's handling of the escape were confirmed
+   independently before restarting the shell — worth doing in that order,
+   because "the character is missing" has three plausible causes and only one
+   of them is in this repo.
 2. **Type-to-switch is gone**, see above.
 
 ### Working on it
@@ -312,11 +319,23 @@ cd ~/gitprojects/omarchy-fido2-lockscreen-plugin
 # edit, then
 git commit -am "..."
 omarchy plugin update erijl.lock      # shows the diff, fast-forwards
+omarchy restart shell                 # not optional -- see below
 ```
 
 That also exercises the same update path a downloader gets. Point `origin` at
 GitHub in the installed checkout once the repo is published, so
 `omarchy plugin update` follows the public repo instead.
+
+**Hot reload does not cover `LockView.qml`.** Saving anything under
+`~/.config/omarchy/plugins/` makes the shell log `Local plugin changed,
+reloading` and re-instantiate the service from its entry point -- but the QML
+engine keeps the already-compiled component for every *other* file in the
+plugin, so an edited `LockView.qml` goes on running the previous version until
+the shell restarts. What makes it worth writing down is how it fails: nothing
+errors, the log says it reloaded, and the change simply is not there. It cost a
+round trip of "the fix does not work" on a fix that was already correct. Any
+change outside `Service.qml` needs `omarchy restart shell` before it means
+anything -- including for downloaders running `omarchy plugin update`.
 
 ### Left undone, deliberately
 

@@ -151,6 +151,11 @@ bin/omarchy-lock-fido2 rebase    # three-way merge onto the new built-in
 ./test/all                       # manifest, qmllint, and fork-base checks
 ```
 
+> **Run `omarchy restart shell` after any `omarchy plugin update`.** The shell
+> hot-reloads a plugin's entry point but keeps the compiled component for its
+> other files, so an updated `LockView.qml` keeps drawing the old version until
+> the shell restarts — silently, with a log line claiming it reloaded.
+
 Worth doing after any `omarchy update` that touches the lock plugin. The real
 fix is upstreaming the feature; until then this keeps the gap visible instead
 of silent.
