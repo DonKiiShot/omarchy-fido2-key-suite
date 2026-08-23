@@ -8,12 +8,21 @@
   "description": "Unlock the Omarchy lock screen with a FIDO2/U2F security key (YubiKey, Token2, Nitrokey) via pam_u2f: touch to unlock, or PIN + touch on keys that require user verification. Uses its own PAM service, so a mistyped password is never spent against the key's PIN retries.",
   "kinds": [
     "service",
-    "panel"
+    "panel",
+    "bar-widget"
   ],
   "keepLoaded": true,
   "entryPoints": {
     "service": "Service.qml",
-    "panel": "ManagementPanel.qml"
+    "panel": "ManagementPanel.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Security key",
+    "description": "Key glyph that dims when no security key is attached; click opens the suite panel",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
   },
   "omarchy": {
     "clonedFrom": "omarchy.lock"

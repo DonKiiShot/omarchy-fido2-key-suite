@@ -157,7 +157,8 @@ Item {
   // The action row is built from state: wiring toggles between enable and
   // disable, and with nothing enrolled there is nothing to wire yet.
   readonly property var actions: {
-    var list = [{ id: "enroll", label: "Enroll a key", icon: "\ueb11" }]
+    var list = [{ id: "enroll", label: "Enroll a key", icon: "\ueb11" },
+                { id: "ssh", label: "SSH key", icon: "\uf120" }]
     if (credentials.length > 0) {
       if (fullyWired) list.push({ id: "disable", label: "Unwire PAM", icon: "\uf00d" })
       else list.push({ id: "enable", label: "Wire up PAM", icon: "\uf00c" })

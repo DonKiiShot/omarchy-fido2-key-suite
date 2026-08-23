@@ -44,6 +44,10 @@ check "declares kind 'service' with an entry point" \
 check "declares kind 'panel' with an entry point" \
   jq -e '(.kinds | index("panel")) != null and (.entryPoints | has("panel"))' "$REPO/manifest.json"
 
+check "declares kind 'bar-widget' with an entry point and a barWidget block" \
+  jq -e '(.kinds | index("bar-widget")) != null and (.entryPoints | has("barWidget"))
+         and (.barWidget | has("displayName") and has("category"))' "$REPO/manifest.json"
+
 check "replaces the built-in lock via clonedFrom" \
   jq -e '.omarchy.clonedFrom == "omarchy.lock"' "$REPO/manifest.json"
 
@@ -85,6 +89,8 @@ if command -v qmllint >/dev/null 2>&1 && [[ -d ${OMARCHY_PATH:-/usr/share/omarch
   check "qmllint ManagementPanel.qml and its components" \
     qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
       "$REPO/ManagementPanel.qml" "$REPO/Notice.qml" "$REPO/WiringRow.qml"
+  check "qmllint BarWidget.qml" \
+    qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" "$REPO/BarWidget.qml"
 else
   skip "qmllint" "qmllint or the Omarchy shell is not installed"
 fi

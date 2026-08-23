@@ -28,6 +28,7 @@ calls="$test_tmp/calls"
 answers="$test_tmp/answers"
 output="$test_tmp/output"
 suite="$test_tmp/suite"
+home="$test_tmp/home"
 
 mkdir -p "$stub_bin"
 
@@ -122,6 +123,24 @@ fi
 exec "$@"
 SH
 
+# Records the flags it was called with and leaves the two files behind, which
+# is all the subcommand needs from it.
+cat >"$stub_bin/ssh-keygen" <<'SH'
+#!/bin/bash
+
+printf 'ssh-keygen %s\n' "$*" >>"$TEST_CALLS"
+
+keyfile=""
+while (( $# > 0 )); do
+  [[ $1 == -f ]] && keyfile=$2
+  shift
+done
+
+[[ -n $keyfile ]] || exit 1
+printf 'PRIVATE\n' >"$keyfile"
+printf 'sk-ssh-ed25519@openssh.com AAAA tester@sandbox\n' >"$keyfile.pub"
+SH
+
 chmod +x "$stub_bin"/*
 
 attach_keys() {
@@ -142,7 +161,8 @@ describe_key() {
 }
 
 reset_state() {
-  rm -rf "$etc"
+  rm -rf "$etc" "$home"
+  mkdir -p "$home"
   mkdir -p "$etc/pam.d"
   printf '#%%PAM-1.0\nauth      include   system-auth\n' >"$sudo_pam"
   : >"$calls"
@@ -168,6 +188,7 @@ run() {
 
   PATH="$stub_bin:$PATH" \
     USER=tester \
+    HOME="$home" \
     TEST_DEVICES="$devices" \
     TEST_KEY_INFO="$key_info" \
     TEST_KEY_HANDLE="$handle" \
@@ -393,6 +414,67 @@ jq -e . <"$output" >/dev/null || fail "state emits valid JSON" "$(cat "$output")
 [[ $(jq -r '.wiring.sudo' <"$output") == "true" ]] ||
   fail "state reports the PAM wiring" "$(cat "$output")"
 pass "state emits the JSON the panel consumes"
+
+# --- ssh mints a key that matches what the authenticator demands -------------
+
+# A key that mandates user verification has to have that recorded on the
+# credential. Without it ssh eventually hands the key an assertion it refuses,
+# which is the SSH shape of the alwaysUv bug this plugin exists to avoid.
+reset_state
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run "" ssh no -- work_key
+
+grep -q "verify-required" "$calls" ||
+  fail "a key that mandates verification records it on the SSH credential" "$(cat "$calls")"
+[[ -f $home/.ssh/work_key.pub ]] ||
+  fail "ssh writes the key where it said it would" "$(cat "$output")"
+grep -q "user.signingkey $home/.ssh/work_key.pub" "$output" ||
+  fail "ssh prints the commit-signing config" "$(cat "$output")"
+pass "ssh records verification on a key that mandates it"
+
+reset_state
+attach_keys "Plain Key"
+describe_key "rk, up, clientPin"
+run "" ssh no -- plain_key
+
+grep -q "verify-required" "$calls" &&
+  fail "a key that does not mandate verification is not forced into it" "$(cat "$calls")"
+grep -q "resident" "$calls" &&
+  fail "resident is not assumed when it was declined" "$(cat "$calls")"
+pass "ssh leaves verification off a key that does not mandate it"
+
+reset_state
+attach_keys "Plain Key"
+describe_key "rk, up, clientPin"
+run "" ssh -- --resident portable_key
+
+grep -q -- "-O resident" "$calls" ||
+  fail "--resident is passed through" "$(cat "$calls")"
+grep -q "ssh-keygen -K" "$output" ||
+  fail "a resident key says how to recover it elsewhere" "$(cat "$output")"
+pass "ssh makes a resident key when asked"
+
+reset_state
+attach_keys "Plain Key"
+describe_key "rk, up, clientPin"
+mkdir -p "$home/.ssh"
+printf 'EXISTING\n' >"$home/.ssh/taken"
+run "" ssh no -- taken || true
+
+[[ $(cat "$home/.ssh/taken") == "EXISTING" ]] ||
+  fail "ssh never overwrites a key that already exists" "$(cat "$output")"
+grep -q "already exists" "$output" ||
+  fail "ssh says why it refused" "$(cat "$output")"
+pass "ssh refuses to overwrite an existing key"
+
+reset_state
+attach_keys
+run "" ssh no -- orphan_key || true
+
+grep -q "no FIDO2 authenticator detected" "$output" ||
+  fail "ssh refuses without an authenticator" "$(cat "$output")"
+pass "ssh refuses without an authenticator attached"
 
 echo
 echo "all management assertions passed"

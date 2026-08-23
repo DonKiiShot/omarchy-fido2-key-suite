@@ -16,11 +16,26 @@ Item {
   // `{ "id": "erijl.lock", "defaultMode": "security-key" }` -- which is where
   // the shell puts per-plugin configuration. shellConfig is reassigned on
   // reload, so this re-evaluates when the user edits the file.
+  //
+  // The bar layout is searched first and the plugins list second, which is the
+  // order the shell's own updateEntryInline writes in: once the bar widget is
+  // on the bar, that layout entry is the plugin's entry, and settings written
+  // from the panel land there. Looking in only one of the two would lose them.
   readonly property var settings: {
     var config = shell && shell.shellConfig ? shell.shellConfig : null
+    if (!config) return ({})
     var id = manifest && manifest.id ? String(manifest.id) : "erijl.lock"
-    var entries = config && Array.isArray(config.plugins) ? config.plugins : []
 
+    var layout = config.bar && config.bar.layout ? config.bar.layout : null
+    var sections = ["left", "center", "right"]
+    for (var s = 0; s < sections.length; s++) {
+      var row = layout && Array.isArray(layout[sections[s]]) ? layout[sections[s]] : []
+      for (var r = 0; r < row.length; r++) {
+        if (row[r] && String(row[r].id).split("#")[0] === id) return row[r]
+      }
+    }
+
+    var entries = Array.isArray(config.plugins) ? config.plugins : []
     for (var i = 0; i < entries.length; i++) {
       if (entries[i] && String(entries[i].id) === id) return entries[i]
     }
@@ -41,7 +56,16 @@ Item {
   // a typo in shell.json should read as "not asked for", not as consent.
   readonly property bool lockOnUnplug: settings.lockOnUnplug === true
   readonly property bool notifyOnKeyChange: settings.notifyOnKeyChange === true
-  readonly property bool watchesPresence: lockOnUnplug || notifyOnKeyChange
+  // Surfaces that show presence -- the bar widget, one instance per monitor --
+  // register while they are mounted. Counted rather than flagged so the last
+  // one leaving is what stops the watching.
+  property int presenceWatchers: 0
+
+  function watchPresence(on) {
+    presenceWatchers = Math.max(0, presenceWatchers + (on ? 1 : -1))
+  }
+
+  readonly property bool watchesPresence: lockOnUnplug || notifyOnKeyChange || presenceWatchers > 0
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: home + "/.local/state"
@@ -926,6 +950,7 @@ Item {
         fido2Token: root.fido2TokenPresent,
         lockOnUnplug: root.lockOnUnplug,
         notifyOnKeyChange: root.notifyOnKeyChange,
+        presenceWatchers: root.presenceWatchers,
         authMode: root.authMode,
         authModeSettled: root.authModeSettled,
         defaultMode: root.defaultMode,

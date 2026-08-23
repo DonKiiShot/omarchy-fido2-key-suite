@@ -39,6 +39,7 @@ USER_NAME=${SUDO_USER:-$USER}
 
 ASSUME_YES=0
 FORCE=0
+RESIDENT=0
 FAILURES=0
 
 # ------------------------------------------------------------------ output
@@ -605,6 +606,79 @@ cmd_repair() {
   fi
 }
 
+# ---------------------------------------------------------------------- ssh
+
+# An SSH key whose private half never leaves the authenticator. The same
+# reading of the key's own CTAP options that enrollment does: a key that
+# mandates user verification needs `verify-required` recorded on the
+# credential, or ssh will one day hand it an assertion it refuses -- the SSH
+# shape of the alwaysUv problem this plugin exists to get right.
+cmd_ssh() {
+  local name=${1:-}
+  require_tools ssh-keygen fido2-token
+
+  local nodes dev info
+  nodes=$(token_nodes)
+  [[ -n $nodes ]] || fail "no FIDO2 authenticator detected -- plug one in and try again"
+
+  dev=$(head -1 <<<"$nodes")
+  info=$(fido2-token -I "$dev") || fail "could not interrogate $dev"
+
+  if [[ -z $name ]]; then
+    name=$(ask_input "File name (default id_ed25519_sk)")
+    [[ -n $name ]] || name="id_ed25519_sk"
+  fi
+
+  local keyfile="$HOME/.ssh/$name"
+  [[ -e $keyfile ]] && fail "$keyfile already exists -- choose another name"
+
+  local -a options=()
+
+  # A resident key is stored on the authenticator, so the same key can be
+  # pulled back out on another machine with `ssh-keygen -K`. It costs one of
+  # the key's resident slots, which is why it is asked rather than assumed.
+  if (( RESIDENT )); then
+    options+=(-O resident)
+  elif (( ! ASSUME_YES )) && confirm "Store the key on the authenticator itself, so another machine can recover it?"; then
+    options+=(-O resident)
+  fi
+
+  if [[ $(token_option alwaysUv "$info") == true || $(token_option uv "$info") == true ]]; then
+    options+=(-O verify-required)
+  fi
+
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  heading "Minting $keyfile on $(token_name "$dev")"
+
+  banner "1. ssh-keygen asks the key for its PIN, if the key wants one
+2. the key blinks -- touch it
+3. then it asks for a passphrase for the file left on disk"
+
+  ssh-keygen -t ed25519-sk -f "$keyfile" -C "$USER_NAME@$(uname -n)" "${options[@]}" ||
+    fail "ssh-keygen did not create a key"
+
+  ok "wrote $keyfile and $keyfile.pub"
+
+  heading "Give it to your Git host"
+  echo
+  sed 's/^/  /' "$keyfile.pub"
+
+  heading "Sign your commits with the same key"
+  note "git config --global gpg.format ssh"
+  note "git config --global user.signingkey $keyfile.pub"
+  note "git config --global commit.gpgsign true"
+
+  heading "Keep in mind"
+  if [[ " ${options[*]} " == *" resident "* ]]; then
+    note "resident: recover it on another machine with 'ssh-keygen -K'"
+  else
+    note "not resident: $keyfile is the only handle for it -- back it up"
+  fi
+  note "every use of this key needs the key attached, and a touch"
+}
+
 # ------------------------------------------------------------------- health
 
 cmd_detect() { [[ -n $(token_nodes) ]]; }
@@ -871,13 +945,10 @@ check_plugin() {
   fi
   ok "$PLUGIN_ID is installed"
 
-  if [[ $(jq -r '.enabled' <<<"$entry") == "true" ]]; then
-    ok "enabled"
-  else
-    bad "installed but not enabled -- the built-in lock screen is still in charge"
-    note "omarchy plugin enable $PLUGIN_ID"
-  fi
-
+  # `omarchy plugin list` answers `enabled` with "is the widget on the bar" for
+  # anything that declares a bar-widget kind, so it cannot say whether the lock
+  # service is the one running. The service can: only this fork's `lock status`
+  # carries the FIDO2 fields.
   local status
   status=$(omarchy-shell lock status 2>/dev/null || true)
   if ! jq -e . >/dev/null 2>&1 <<<"$status"; then
@@ -887,9 +958,16 @@ check_plugin() {
   fi
 
   if [[ $(jq -r 'has("fido2Pam")' <<<"$status") != "true" ]]; then
-    bad "the running lock service has no FIDO2 support"
-    note "the built-in plugin is loaded, not this one; omarchy restart shell"
+    bad "the built-in lock screen is in charge, not this plugin"
+    note "omarchy plugin enable $PLUGIN_ID && omarchy restart shell"
     return
+  fi
+  ok "this plugin's lock service is the one running"
+
+  if [[ $(jq -r '.enabled' <<<"$entry") == "true" ]]; then
+    ok "the bar widget is on the bar"
+  else
+    note "the bar widget is not on the bar -- add it with: omarchy plugin enable $PLUGIN_ID"
   fi
 
   printf '    %s%s%s\n' "$DIM" \
@@ -1024,12 +1102,15 @@ cmd_rebase() {
 
 usage() {
   cat <<USAGE
-Usage: omarchy-fido2-suite <command> [--yes] [--force]
+Usage: omarchy-fido2-suite <command> [--yes] [--force] [--resident]
 
 Credentials
   enroll [label]  enroll a security key (only one may be attached)
   list            list enrolled credentials  (--porcelain for TSV)
   remove [n]      remove one credential
+
+SSH
+  ssh [name]      mint an SSH key held on the authenticator (--resident)
 
 Wiring
   setup           write $PAM_SERVICE (lock screen only; asks for sudo)
@@ -1052,9 +1133,10 @@ command=""
 declare -a args=()
 while (( $# > 0 )); do
   case "$1" in
-  enroll | list | remove | setup | enable | disable | repair | status | doctor | state | detect | rebase) command="$1"; shift ;;
+  enroll | list | remove | ssh | setup | enable | disable | repair | status | doctor | state | detect | rebase) command="$1"; shift ;;
   --yes | -y) ASSUME_YES=1; shift ;;
   --force) FORCE=1; shift ;;
+  --resident) RESIDENT=1; shift ;;
   -h | --help) usage; exit 0 ;;
   *)
     [[ -n $command ]] || fail "unknown argument: $1"
@@ -1066,6 +1148,7 @@ case "$command" in
 enroll) cmd_enroll "${args[@]:-}" ;;
 list) cmd_list "${args[@]:-}" ;;
 remove) cmd_remove_credential "${args[@]:-}" ;;
+ssh) cmd_ssh "${args[@]:-}" ;;
 setup) cmd_setup ;;
 enable) cmd_enable ;;
 disable) cmd_disable ;;
