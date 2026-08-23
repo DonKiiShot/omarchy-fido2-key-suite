@@ -172,7 +172,7 @@ names its own fix.
 
 The lock screen is a fork of `omarchy.lock`, declared via the manifest's
 `clonedFrom` so enabling this plugin steps the built-in aside. Upstream fixes do
-not arrive by themselves. `upstream/` holds the built-in's files at the forked
+not arrive by themselves. `upstream/lock/` holds the built-in's files at the forked
 revision plus their hashes, making drift a hash compare and a re-base a
 three-way merge:
 

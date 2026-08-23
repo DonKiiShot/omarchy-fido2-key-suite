@@ -67,6 +67,14 @@ fi
 # The marketplace picks this up from the repo root for the listing.
 check "preview.png is present" test -f "$REPO/preview.png"
 
+# The marketplace counts a manifest.json at the root OR one directory below it
+# as a plugin, and rejects a submission carrying more than one. The upstream
+# snapshot therefore has to sit two levels down.
+check "only the root manifest.json is within the marketplace's reach" bash -c '
+  cd "$1" || exit 1
+  found=$(git ls-files | grep -E "^([^/]+/)?manifest\\.json$")
+  [[ $found == "manifest.json" ]] || { echo "matched: $found"; exit 1; }' _ "$REPO"
+
 check "no symlinks anywhere in the folder" bash -c '
   link=$(find "$1" -name .git -prune -o -type l -print -quit)
   [[ -z $link ]] || { echo "symlink: $link"; exit 1; }' _ "$REPO"
@@ -145,19 +153,19 @@ if [[ ! -d $OMARCHY_LOCK_DIR ]]; then
   skip "fork base matches the installed lock plugin" "$OMARCHY_LOCK_DIR not found"
 else
   for file in "${UPSTREAM_FILES[@]}"; do
-    recorded=$(grep -oP "^sha256_$file=\K.*" "$REPO/upstream/BASE" 2>/dev/null)
-    snapshot=$(sha256sum "$REPO/upstream/$file" 2>/dev/null | cut -d' ' -f1)
+    recorded=$(grep -oP "^sha256_$file=\K.*" "$REPO/upstream/lock/BASE" 2>/dev/null)
+    snapshot=$(sha256sum "$REPO/upstream/lock/$file" 2>/dev/null | cut -d' ' -f1)
     installed=$(sha256sum "$OMARCHY_LOCK_DIR/$file" 2>/dev/null | cut -d' ' -f1)
 
     if [[ -z $recorded || -z $snapshot ]]; then
-      flunk "upstream/$file is recorded in BASE"
+      flunk "upstream/lock/$file is recorded in BASE"
     elif [[ $recorded != "$snapshot" ]]; then
-      flunk "upstream/$file matches its hash in BASE" "recorded $recorded, file $snapshot"
+      flunk "upstream/lock/$file matches its hash in BASE" "recorded $recorded, file $snapshot"
     elif [[ $recorded != "$installed" ]]; then
-      flunk "upstream/$file matches the installed lock plugin" \
+      flunk "upstream/lock/$file matches the installed lock plugin" \
         "upstream has moved -- run: bin/omarchy-fido2-suite rebase"
     else
-      pass "upstream/$file is current"
+      pass "upstream/lock/$file is current"
     fi
   done
 fi

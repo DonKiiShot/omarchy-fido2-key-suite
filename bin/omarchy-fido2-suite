@@ -1005,9 +1005,9 @@ check_plugin() {
 check_upstream() {
   heading "Upstream"
 
-  local base="$PLUGIN_DIR/upstream/BASE"
+  local base="$PLUGIN_DIR/upstream/lock/BASE"
   if [[ ! -f $base ]]; then
-    warn "upstream/BASE is missing; cannot tell whether this fork is current"
+    warn "upstream/lock/BASE is missing; cannot tell whether this fork is current"
     return
   fi
 
@@ -1032,7 +1032,7 @@ check_upstream() {
   if (( drift )); then
     bad "Omarchy's lock plugin has moved since this fork was taken ($recorded_version -> $installed_version)"
     note "this fork is missing whatever changed. Look, then merge:"
-    note "  diff -u $PLUGIN_DIR/upstream/Service.qml $OMARCHY_LOCK_DIR/Service.qml"
+    note "  diff -u $PLUGIN_DIR/upstream/lock/Service.qml $OMARCHY_LOCK_DIR/Service.qml"
     note "  $0 rebase"
   else
     ok "fork is current with the installed lock plugin ($recorded_version)"
@@ -1095,8 +1095,8 @@ cmd_doctor() {
 # ------------------------------------------------------------------ rebase
 
 cmd_rebase() {
-  local base="$PLUGIN_DIR/upstream/BASE"
-  [[ -f $base ]] || fail "upstream/BASE is missing"
+  local base="$PLUGIN_DIR/upstream/lock/BASE"
+  [[ -f $base ]] || fail "upstream/lock/BASE is missing"
   [[ -d $OMARCHY_LOCK_DIR ]] || fail "$OMARCHY_LOCK_DIR not found"
   have git || fail "git is required"
 
@@ -1117,13 +1117,13 @@ cmd_rebase() {
 
     changed=1
     if git merge-file -L "this fork" -L "fork base" -L "new upstream" \
-      "$PLUGIN_DIR/$file" "$PLUGIN_DIR/upstream/$file" "$OMARCHY_LOCK_DIR/$file"; then
+      "$PLUGIN_DIR/$file" "$PLUGIN_DIR/upstream/lock/$file" "$OMARCHY_LOCK_DIR/$file"; then
       ok "$file merged cleanly"
     else
       conflicts=1
       warn "$file merged with conflicts -- resolve the <<<<<<< markers by hand"
     fi
-    cp -- "$OMARCHY_LOCK_DIR/$file" "$PLUGIN_DIR/upstream/$file"
+    cp -- "$OMARCHY_LOCK_DIR/$file" "$PLUGIN_DIR/upstream/lock/$file"
   done
 
   if (( ! changed )); then
@@ -1144,11 +1144,11 @@ cmd_rebase() {
       -e "s/^forked_on=.*/forked_on=$(date -I)/" \
       -e "/^sha256_/d" "$base"
     for file in "${UPSTREAM_FILES[@]}"; do
-      echo "sha256_$file=$(sha256sum "$PLUGIN_DIR/upstream/$file" | cut -d' ' -f1)"
+      echo "sha256_$file=$(sha256sum "$PLUGIN_DIR/upstream/lock/$file" | cut -d' ' -f1)"
     done
   } >"$base.new"
   mv -- "$base.new" "$base"
-  ok "upstream/ and upstream/BASE updated to $version"
+  ok "upstream/lock/ and its BASE updated to $version"
 
   echo
   echo "Next:"
