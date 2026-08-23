@@ -106,6 +106,20 @@ check "the security-key glyph is not empty" bash -c '
   grep -A 10 "objectName: \"fido2Indicator\"" "$1/LockView.qml" \
     | grep -qE "^\s+text: \"[^\"]+\"$"' _ "$REPO"
 
+# Both presence settings are opt-in. A truthy test would turn lockOnUnplug on
+# for anyone who wrote "false" as a string, and locking someone's session is
+# not a thing to do by accident.
+check "presence settings are off unless set to exactly true" bash -c '
+  grep -q "settings.lockOnUnplug === true" "$1/Service.qml" \
+    && grep -q "settings.notifyOnKeyChange === true" "$1/Service.qml"' _ "$REPO"
+
+# An enrollment running in a terminal holds the key, so an enumeration can
+# come back empty while the key is still plugged in. Locking on that reading
+# would lock the screen under a user halfway through typing a PIN.
+check "an unplug is confirmed before it locks anything" bash -c '
+  grep -q "fido2AbsencePending" "$1/Service.qml" \
+    && grep -q "fido2AbsenceConfirmTimer" "$1/Service.qml"' _ "$REPO"
+
 # The panel displays state and launches terminals; the moment it runs sudo (or
 # anything else privileged) itself, the "the shell never runs privileged code"
 # promise in the README and the marketplace submission stops being true.

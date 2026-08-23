@@ -8,7 +8,6 @@ Item {
   id: root
 
   property string label: ""
-  property string detail: ""
   property bool wired: false
   property color foreground: Color.foreground
   property color dim: Qt.darker(Color.foreground, 1.5)
@@ -43,13 +42,12 @@ Item {
     }
 
     Text {
-      text: root.wired ? root.detail : "not wired"
+      text: root.wired ? "" : "not wired"
+      visible: !root.wired
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       anchors.verticalCenter: parent.verticalCenter
-      elide: Text.ElideRight
-      width: Math.max(0, row.width - x)
     }
   }
 }

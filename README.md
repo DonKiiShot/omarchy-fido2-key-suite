@@ -58,6 +58,22 @@ retries by itself — each one can cost one of the key's PIN retries.
 Optional `"defaultMode"` on this plugin's entry in `shell.json`: `auto`
 (default), `password` to never start on the key, `security-key` to always.
 
+## When the key comes and goes
+
+Two more keys on the same entry, both off by default and both toggleable from
+the panel:
+
+| Setting | What it does |
+|---|---|
+| `"lockOnUnplug": true` | Locks the session the moment the key leaves the machine. |
+| `"notifyOnKeyChange": true` | A low-urgency notification when the key comes and goes. |
+
+Either one keeps the service watching for the key while the session is
+unlocked; with both off it only looks while the lock screen is up, which is
+the only time it otherwise needs to know. An unplug has to be seen twice
+before it counts — a key busy answering an enrollment in a terminal can miss
+one enumeration, and that must not lock the screen under you mid-PIN.
+
 ## Why the key gets its own PAM service
 
 The shortcut is `auth sufficient pam_u2f.so` in `omarchy-lock-password`, with

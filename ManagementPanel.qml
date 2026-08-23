@@ -85,6 +85,13 @@ Item {
   readonly property bool sudoWired: !!(wiring && wiring.sudo)
   readonly property bool polkitWired: !!(wiring && wiring.polkit)
   readonly property bool fullyWired: lockWired && sudoWired && polkitWired
+  // Presence settings live on the service, which reads them from this
+  // plugin's inline entry in shell.json. Reading them there rather than
+  // re-parsing the file keeps one owner for the answer.
+  readonly property bool lockOnUnplug: !!(service && service.lockOnUnplug)
+  readonly property bool notifyOnKeyChange: !!(service && service.notifyOnKeyChange)
+  readonly property bool canEditSettings: !!(service && shell && typeof shell.updateEntryInline === "function")
+
   readonly property bool authfileOwned: !suiteState || String(suiteState.authfileOwner || "") === "root:root"
 
   function refresh() {
@@ -112,6 +119,21 @@ Item {
     requestClose()
   }
 
+  // ---- settings -----------------------------------------------------------
+
+  // updateEntryInline rewrites the plugin's shell.json entry from what it is
+  // handed, so the whole entry has to go back or a toggle here would erase
+  // defaultMode. The service re-reads shellConfig when it is persisted, and
+  // the toggles below follow from there.
+  function setSetting(name, value) {
+    if (!canEditSettings) return
+    var current = service.settings || ({})
+    var next = {}
+    for (var key in current) if (key !== "id") next[key] = current[key]
+    next[name] = value
+    shell.updateEntryInline("erijl.lock", next)
+  }
+
   // ---- cursor model -------------------------------------------------------
   //
   // The shared panel recipe: focusSection + selectedIndex drive one
@@ -127,6 +149,7 @@ Item {
   readonly property var visibleSections: {
     var sections = []
     if (credentials.length > 0) sections.push("credentials")
+    if (canEditSettings) sections.push("settings")
     sections.push("actions")
     return sections
   }
@@ -146,6 +169,7 @@ Item {
 
   function sectionCount(section) {
     if (section === "credentials") return credentials.length
+    if (section === "settings") return 2
     if (section === "actions") return actions.length
     return 0
   }
@@ -209,6 +233,11 @@ Item {
     if (revealCursor()) return
     if (focusSection === "credentials") {
       removeCredential(selectedIndex)
+      return
+    }
+    if (focusSection === "settings") {
+      if (selectedIndex === 0) setSetting("lockOnUnplug", !lockOnUnplug)
+      else setSetting("notifyOnKeyChange", !notifyOnKeyChange)
       return
     }
     if (focusSection === "actions") {
@@ -414,16 +443,6 @@ Item {
                 }
               }
 
-              Text {
-                width: parent.width
-                wrapMode: Text.WordWrap
-                text: root.suiteState && root.suiteState.user
-                  ? "Credentials and PAM wiring for " + root.suiteState.user + ". Every change runs as a command in a terminal, never inside the shell."
-                  : "Credentials and PAM wiring. Every change runs as a command in a terminal, never inside the shell."
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
             }
 
             // ---- the state command failed ---------------------------------
@@ -452,9 +471,7 @@ Item {
                 width: parent.width
                 visible: root.tokens.length === 0
                 wrapMode: Text.WordWrap
-                text: root.stateLoaded
-                  ? "No security key attached. Plug one in and press r."
-                  : "Reading…"
+                text: root.stateLoaded ? "None attached" : "Reading"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -532,7 +549,7 @@ Item {
                 tone: root.urgent
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                text: "Few PIN attempts left. They only reset after a successful PIN entry; at zero the key locks itself out and only a factory reset -- which destroys every credential on it -- brings it back."
+                text: "Few PIN attempts left. At zero the key locks itself out and only a factory reset brings it back."
               }
             }
 
@@ -553,7 +570,7 @@ Item {
                 width: parent.width
                 visible: root.stateLoaded && root.credentials.length === 0
                 wrapMode: Text.WordWrap
-                text: "Nothing enrolled yet. Enroll a key below -- until then the lock screen falls back to your password."
+                text: "None enrolled"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -635,7 +652,7 @@ Item {
                 tone: root.accent
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                text: "One credential, one key. Enroll a second key and keep it somewhere else -- losing this one takes sudo, polkit and the lock screen with it."
+                text: "Only one credential enrolled. A second key is the way back in if this one is lost."
               }
 
               Notice {
@@ -645,7 +662,7 @@ Item {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 text: root.suiteState
-                  ? "The mapping file is owned by " + String(root.suiteState.authfileOwner) + " rather than root:root -- a user-writable authfile is a way around every prompt it guards. Run Repair."
+                  ? "The mapping file is owned by " + String(root.suiteState.authfileOwner) + ", not root:root. Run Repair."
                   : ""
               }
             }
@@ -665,7 +682,6 @@ Item {
               WiringRow {
                 width: parent.width
                 label: "Lock screen"
-                detail: "PAM service omarchy-lock-fido2"
                 wired: root.lockWired
                 foreground: root.foreground
                 dim: root.dim
@@ -676,7 +692,6 @@ Item {
               WiringRow {
                 width: parent.width
                 label: "sudo"
-                detail: "key instead of your password at the sudo prompt"
                 wired: root.sudoWired
                 foreground: root.foreground
                 dim: root.dim
@@ -687,13 +702,54 @@ Item {
               WiringRow {
                 width: parent.width
                 label: "polkit"
-                detail: "the shell's own authentication dialog"
                 wired: root.polkitWired
                 foreground: root.foreground
                 dim: root.dim
                 accent: root.accent
                 fontFamily: root.fontFamily
               }
+            }
+
+            // ---- presence settings ----------------------------------------
+            Column {
+              id: settingsColumn
+              width: parent.width
+              spacing: Style.space(6)
+              visible: root.canEditSettings
+
+              PanelSeparator { foreground: root.foreground }
+              PanelSectionHeader {
+                text: "WHEN THE KEY COMES AND GOES"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Lock when the key is removed"
+                description: "Locks the session when the key leaves"
+                checked: root.lockOnUnplug
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                hasCursor: root.cursorActive && root.focusSection === "settings" && root.selectedIndex === 0
+                onHovered: function(isHovered) { if (isHovered) root.setCursor("settings", 0) }
+                onClicked: root.setSetting("lockOnUnplug", !root.lockOnUnplug)
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Notify on plug and unplug"
+                description: "A notification when the key comes and goes"
+                checked: root.notifyOnKeyChange
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                hasCursor: root.cursorActive && root.focusSection === "settings" && root.selectedIndex === 1
+                onHovered: function(isHovered) { if (isHovered) root.setCursor("settings", 1) }
+                onClicked: root.setSetting("notifyOnKeyChange", !root.notifyOnKeyChange)
+              }
+
             }
 
             // ---- actions --------------------------------------------------
@@ -733,7 +789,7 @@ Item {
               Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "j/k move  ·  h/l within a row  ·  Enter act  ·  x remove a credential  ·  r refresh  ·  Esc close"
+                text: "j/k move  ·  Enter act  ·  x remove  ·  r refresh  ·  Esc close"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

@@ -35,6 +35,14 @@ Item {
     return ["auto", "password", "security-key"].indexOf(mode) !== -1 ? mode : "auto"
   }
 
+  // Both off by default, so a stock install adds no background work: turning
+  // either on is what starts watching for the key while the session is
+  // unlocked (see fido2DetectTimer). `=== true` rather than a truthy test --
+  // a typo in shell.json should read as "not asked for", not as consent.
+  readonly property bool lockOnUnplug: settings.lockOnUnplug === true
+  readonly property bool notifyOnKeyChange: settings.notifyOnKeyChange === true
+  readonly property bool watchesPresence: lockOnUnplug || notifyOnKeyChange
+
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: home + "/.local/state"
   readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME")
@@ -68,6 +76,10 @@ Item {
   property bool fido2PamConfigured: false
   property bool fido2Enrolled: false
   property bool fido2TokenPresent: false
+  // The first enumeration is an observation, not a change: without this the
+  // service would announce "key attached" at every login.
+  property bool fido2PresenceKnown: false
+  property bool fido2AbsencePending: false
   property bool fido2Authenticating: false
   property bool fido2NeedsPin: false
   property string fido2Status: ""
@@ -160,6 +172,39 @@ Item {
   // offers the key or says there is none to offer.
   function refreshFido2Token() {
     if (!fido2DetectProc.running) fido2DetectProc.running = true
+  }
+
+  // Called only for a real transition, and only once the first reading is in.
+  function announcePresence(present) {
+    logEvent(present ? "key-attached" : "key-removed")
+    if (!present && lockOnUnplug) lockForUnplug()
+
+    // Deliberately after the lock decision, so `locked` covers both a session
+    // that was already locked and one this very removal just locked. A banner
+    // raised behind the lock surface is one nobody can read -- it went up
+    // 6ms before the lock and was buried by it -- and where the screen locks,
+    // the lock screen is the better answer to "where did my key go" anyway.
+    // If beginLock refused (no working password service) nothing is locked,
+    // and the notification goes out after all.
+    if (notifyOnKeyChange && !locked) notifyKeyChange(present)
+  }
+
+  function notifyKeyChange(present) {
+    notifyProcess.command = ["notify-send", "-u", "low",
+      present ? "Security key attached" : "Security key removed",
+      present
+        ? "The lock screen will offer it."
+        : "The lock screen will ask for your password."]
+    notifyProcess.running = true
+  }
+
+  // Pulling the key out is a request to lock, not to log out: beginLock()
+  // refuses without a working password service, which is what keeps this from
+  // stranding anyone behind a key they just unplugged.
+  function lockForUnplug() {
+    if (locked || lockRequested) return
+    logEvent("lock-on-unplug")
+    beginLock()
   }
 
   // Pick the factor once per lock: by default the key if one is enrolled and
@@ -581,15 +626,33 @@ Item {
     onTriggered: root.startFingerprint()
   }
 
-  // Only while the key is actually being offered: a key plugged in mid-lock
-  // should light the UI up, but polling a hidraw enumeration forever behind a
-  // password prompt nobody is looking at is pure waste.
+  // While the key is being offered on the lock screen -- a key plugged in
+  // mid-lock should light the UI up -- and while the session is unlocked only
+  // if the user asked for something that depends on presence. Polling a
+  // hidraw enumeration forever behind a password prompt nobody is looking at
+  // is pure waste, and so is polling for a feature nobody turned on.
   Timer {
     id: fido2DetectTimer
     interval: 2000
     repeat: true
-    running: root.locked && root.fido2Configured
+    running: root.fido2Configured && (root.locked || root.watchesPresence)
     onTriggered: root.refreshFido2Token()
+  }
+
+  // A single missed enumeration is not an unplug. A key busy answering
+  // another process -- an enrollment running in a terminal -- can fail to
+  // answer, and with lockOnUnplug on that would lock the screen under a user
+  // who is halfway through a PIN. A disappearance counts once it is seen
+  // twice.
+  Timer {
+    id: fido2AbsenceConfirmTimer
+    interval: 700
+    repeat: false
+    onTriggered: root.refreshFido2Token()
+  }
+
+  Process {
+    id: notifyProcess
   }
 
   Process {
@@ -650,7 +713,17 @@ Item {
     stdout: StdioCollector { id: fido2DetectStdout; waitForEnd: true }
     onExited: {
       var present = String(fido2DetectStdout.text || "").trim() === "yes"
+
+      if (!present && root.fido2TokenPresent && !root.fido2AbsencePending) {
+        root.fido2AbsencePending = true
+        fido2AbsenceConfirmTimer.restart()
+        return
+      }
+      root.fido2AbsencePending = false
+
+      if (root.fido2PresenceKnown && present !== root.fido2TokenPresent) root.announcePresence(present)
       root.fido2TokenPresent = present
+      root.fido2PresenceKnown = true
 
       if (!present) {
         if (root.fido2Active) {
@@ -851,6 +924,8 @@ Item {
         fido2Pam: root.fido2PamConfigured,
         fido2Enrolled: root.fido2Enrolled,
         fido2Token: root.fido2TokenPresent,
+        lockOnUnplug: root.lockOnUnplug,
+        notifyOnKeyChange: root.notifyOnKeyChange,
         authMode: root.authMode,
         authModeSettled: root.authModeSettled,
         defaultMode: root.defaultMode,
