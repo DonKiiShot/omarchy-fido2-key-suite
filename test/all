@@ -41,6 +41,9 @@ check "id is not in the reserved omarchy.* namespace" \
 check "declares kind 'service' with an entry point" \
   jq -e '(.kinds | index("service")) != null and (.entryPoints | has("service"))' "$REPO/manifest.json"
 
+check "declares kind 'panel' with an entry point" \
+  jq -e '(.kinds | index("panel")) != null and (.entryPoints | has("panel"))' "$REPO/manifest.json"
+
 check "replaces the built-in lock via clonedFrom" \
   jq -e '.omarchy.clonedFrom == "omarchy.lock"' "$REPO/manifest.json"
 
@@ -79,6 +82,9 @@ printf '\n\e[1mQML\e[0m\n'
 if command -v qmllint >/dev/null 2>&1 && [[ -d ${OMARCHY_PATH:-/usr/share/omarchy}/shell ]]; then
   check "qmllint Service.qml LockView.qml" \
     qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" "$REPO/Service.qml" "$REPO/LockView.qml"
+  check "qmllint ManagementPanel.qml and its components" \
+    qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
+      "$REPO/ManagementPanel.qml" "$REPO/Notice.qml" "$REPO/WiringRow.qml"
 else
   skip "qmllint" "qmllint or the Omarchy shell is not installed"
 fi
@@ -99,6 +105,16 @@ check "the FIDO2 PAM service is not shared with the password one" bash -c '
 check "the security-key glyph is not empty" bash -c '
   grep -A 10 "objectName: \"fido2Indicator\"" "$1/LockView.qml" \
     | grep -qE "^\s+text: \"[^\"]+\"$"' _ "$REPO"
+
+# The panel displays state and launches terminals; the moment it runs sudo (or
+# anything else privileged) itself, the "the shell never runs privileged code"
+# promise in the README and the marketplace submission stops being true.
+check "the panel never runs a privileged command itself" bash -c '
+  ! grep -nE "^[^/]*(command:|execDetached)" "$1/ManagementPanel.qml" \
+    | grep -qE "sudo|pkexec|\binstall\b|tee"' _ "$REPO"
+check "every panel action goes through the terminal wrapper" bash -c '
+  ! grep -n "execDetached" "$1/ManagementPanel.qml" \
+    | grep -qv "omarchy-launch-floating-terminal-with-presentation"' _ "$REPO"
 
 printf '\n\e[1mUpstream\e[0m\n'
 
