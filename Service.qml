@@ -802,7 +802,7 @@ Item {
     onFileChanged: reload()
   }
 
-  // Watched for the same reason, and so that running `omarchy-lock-fido2 setup`
+  // Watched for the same reason, and so that running `omarchy-fido2-suite setup`
   // takes effect on the running shell rather than at the next restart.
   FileView {
     path: "/etc/pam.d/omarchy-lock-fido2"

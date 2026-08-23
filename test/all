@@ -61,8 +61,18 @@ check "no symlinks anywhere in the folder" bash -c '
   link=$(find "$1" -name .git -prune -o -type l -print -quit)
   [[ -z $link ]] || { echo "symlink: $link"; exit 1; }' _ "$REPO"
 
-check "bin/omarchy-lock-fido2 parses" bash -n "$REPO/bin/omarchy-lock-fido2"
-check "bin/omarchy-lock-fido2 is executable" test -x "$REPO/bin/omarchy-lock-fido2"
+check "bin/omarchy-fido2-suite parses" bash -n "$REPO/bin/omarchy-fido2-suite"
+check "bin/omarchy-fido2-suite is executable" test -x "$REPO/bin/omarchy-fido2-suite"
+
+printf '\n\e[1mManagement\e[0m\n'
+
+manage_log=$(mktemp)
+if "$REPO/test/manage" >"$manage_log" 2>&1; then
+  pass "management subcommands behave ($(grep -c '^  ✓' "$manage_log") assertions)"
+else
+  flunk "management subcommands behave" "$(cat "$manage_log")"
+fi
+rm -f "$manage_log"
 
 printf '\n\e[1mQML\e[0m\n'
 

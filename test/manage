@@ -1,0 +1,398 @@
+#!/bin/bash
+
+# Behavioral tests for the management subcommands, no hardware and no /etc.
+#
+# The script writes to absolute paths under /etc. Rather than teaching it an
+# environment seam that exists only for tests, those paths are sed-ed into a
+# sandbox in a copy and the copy is run -- the same pattern Omarchy's own
+# test/shell.d uses. fido2-token, pamu2fcfg, gum and sudo are stubs on PATH
+# that record their calls.
+
+set -euo pipefail
+
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+test_tmp=$(mktemp -d)
+trap 'rm -rf "$test_tmp"' EXIT
+
+stub_bin="$test_tmp/bin"
+etc="$test_tmp/etc"
+mapping_file="$etc/fido2/fido2"
+label_file="$etc/fido2/tokens"
+sudo_pam="$etc/pam.d/sudo"
+polkit_pam="$etc/pam.d/polkit-1"
+lock_pam="$etc/pam.d/omarchy-lock-fido2"
+devices="$test_tmp/devices"
+key_info="$test_tmp/key-info"
+calls="$test_tmp/calls"
+answers="$test_tmp/answers"
+output="$test_tmp/output"
+suite="$test_tmp/suite"
+
+mkdir -p "$stub_bin"
+
+pass() { printf '  ✓ %s\n' "$1"; }
+fail() {
+  printf '  ✗ %s\n' "$1"
+  [[ -n ${2:-} ]] && printf '%s\n' "$2"
+  exit 1
+}
+
+sed -e "s|/etc/fido2|$etc/fido2|g" -e "s|/etc/pam.d|$etc/pam.d|g" \
+  "$REPO/bin/omarchy-fido2-suite" >"$suite"
+chmod +x "$suite"
+
+cat >"$stub_bin/fido2-token" <<'SH'
+#!/bin/bash
+
+case $1 in
+-L) cat "$TEST_DEVICES" ;;
+-I)
+  [[ ${TEST_INFO_UNREADABLE:-0} == 0 ]] || exit 1
+  cat "$TEST_KEY_INFO"
+  ;;
+esac
+SH
+
+# Prints the same shape the real one does: a leading colon, no username, and
+# the verification flags the registration was asked for.
+cat >"$stub_bin/pamu2fcfg" <<'SH'
+#!/bin/bash
+
+printf 'pamu2fcfg %s\n' "$*" >>"$TEST_CALLS"
+[[ ${TEST_REGISTRATION_FAILS:-0} == 0 ]] || exit 1
+
+options="+presence"
+case " $* " in
+*" -N "*) options="$options+pin" ;;
+*" -V "*) options="$options+verification" ;;
+esac
+
+printf ':%s,cHVia2V5,es256,%s' "$TEST_KEY_HANDLE" "$options"
+SH
+
+# Answers are queued one per line and consumed in order. `style` renders and
+# consumes nothing; everything else takes the next queued answer.
+cat >"$stub_bin/gum" <<'SH'
+#!/bin/bash
+
+command=$1
+shift
+
+if [[ $command == style ]]; then
+  while [[ ${1:-} == --* ]]; do
+    case $1 in --border | --padding | --margin) shift 2 ;; *) shift ;; esac
+  done
+  printf '%s\n' "$@"
+  exit 0
+fi
+
+answer=$(head -1 "$TEST_ANSWERS")
+sed -i 1d "$TEST_ANSWERS"
+printf 'gum %s: %s\n' "$command" "$answer" >>"$TEST_CALLS"
+
+case $command in
+confirm) [[ $answer == "yes" ]] ;;
+input) printf '%s\n' "$answer" ;;
+esac
+SH
+
+# Ownership is the assertion, so record the real arguments and then copy
+# without them: the tests do not run as root.
+cat >"$stub_bin/sudo" <<'SH'
+#!/bin/bash
+
+printf 'sudo %s\n' "$*" >>"$TEST_CALLS"
+
+if [[ $1 == "install" ]]; then
+  shift
+  arguments=()
+  while (( $# > 0 )); do
+    case $1 in
+    -o | -g) shift 2 ;;
+    *)
+      arguments+=("$1")
+      shift
+      ;;
+    esac
+  done
+  exec install "${arguments[@]}"
+fi
+
+exec "$@"
+SH
+
+chmod +x "$stub_bin"/*
+
+attach_keys() {
+  : >"$devices"
+  local index=0 name
+  for name in "$@"; do
+    printf '/dev/hidraw%d: vendor=0x349e, product=0x0024 (%s)\n' "$index" "$name" >>"$devices"
+    index=$((index + 1))
+  done
+}
+
+describe_key() {
+  {
+    echo "proto: 0x02"
+    [[ -n $1 ]] && echo "options: $1"
+    echo "pin retries: 8"
+  } >"$key_info"
+}
+
+reset_state() {
+  rm -rf "$etc"
+  mkdir -p "$etc/pam.d"
+  printf '#%%PAM-1.0\nauth      include   system-auth\n' >"$sudo_pam"
+  : >"$calls"
+}
+
+# Each run gets its own answer queue, so an unconsumed answer can never leak
+# into the next scenario and make it pass for the wrong reason.
+run() {
+  local handle=$1
+  shift
+  local subcommand=$1
+  shift
+  local -a queue=() args=()
+  local in_args=0 item
+  for item in "$@"; do
+    if [[ $item == -- ]]; then in_args=1; continue; fi
+    if (( in_args )); then args+=("$item"); else queue+=("$item"); fi
+  done
+
+  : >"$answers"
+  (( ${#queue[@]} )) && printf '%s\n' "${queue[@]}" >"$answers"
+  : >"$calls"
+
+  PATH="$stub_bin:$PATH" \
+    USER=tester \
+    TEST_DEVICES="$devices" \
+    TEST_KEY_INFO="$key_info" \
+    TEST_KEY_HANDLE="$handle" \
+    TEST_CALLS="$calls" \
+    TEST_ANSWERS="$answers" \
+    TEST_INFO_UNREADABLE="${TEST_INFO_UNREADABLE:-0}" \
+    TEST_REGISTRATION_FAILS="${TEST_REGISTRATION_FAILS:-0}" \
+    bash "$suite" "$subcommand" "${args[@]:-}" >"$output" 2>&1
+}
+
+credential_options() {
+  cut -d: -f"$(( $1 + 1 ))" "$mapping_file" | cut -d, -f4
+}
+
+# --- registration flags follow what the authenticator reports ----------------
+
+# The decision table, driven end to end: what the key says about itself decides
+# the flags pamu2fcfg is given, which decides what is recorded against the
+# credential. Getting this wrong in either direction breaks authentication.
+check_registration() {
+  local description=$1 expected=$2 options=$3
+
+  reset_state
+  attach_keys "Test Key"
+  describe_key "$options"
+  run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll yes -- "Table" || true
+
+  if [[ $expected == "refused" ]]; then
+    [[ ! -f $mapping_file ]] ||
+      fail "$description" "$(cat "$mapping_file")"
+    grep -q "no PIN set" "$output" ||
+      fail "$description" "$(cat "$output")"
+  else
+    [[ -f $mapping_file ]] || fail "$description" "$(cat "$output")"
+    [[ $(credential_options 1) == "$expected" ]] ||
+      fail "$description" "recorded $(credential_options 1), wanted $expected"
+  fi
+
+  pass "$description"
+}
+
+# The key that motivated this: verification mandatory in firmware, PIN set.
+check_registration "an alwaysUv key with a PIN records the PIN requirement" "+presence+pin" \
+  "rk, up, noplat, alwaysUv, credMgmt, authnrCfg, clientPin, pinUvAuthToken, nomakeCredUvNotRqd"
+
+# A stock YubiKey out of the box, which is the case that works today and has to
+# keep working exactly as it does.
+check_registration "a key with no PIN configured stays presence-only" "+presence" \
+  "rk, up, noplat, noclientPin, credMgmt"
+
+check_registration "a key with a PIN records the PIN requirement" "+presence+pin" \
+  "rk, up, noplat, clientPin, credMgmt"
+
+check_registration "a key with built-in verification uses it" "+presence+verification" \
+  "rk, up, noplat, uv, clientPin, credMgmt, bioEnroll"
+
+# nouv means the key supports verification but none is enrolled, so it has to
+# fall through to the PIN rather than ask for verification that cannot happen.
+check_registration "a key advertising unenrolled verification falls back to the PIN" "+presence+pin" \
+  "rk, up, nouv, clientPin"
+
+# Nothing can satisfy the requirement, so a credential written here could never
+# authenticate.
+check_registration "a key that mandates verification with no PIN is refused" "refused" \
+  "rk, up, noplat, alwaysUv, noclientPin"
+
+# An old U2F-only token has no CTAP2 options line at all.
+check_registration "a key with no options line stays presence-only" "+presence" ""
+
+# --- wiring follows the enrollment -------------------------------------------
+
+reset_state
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll yes -- "Daily"
+
+grep -q 'pam_u2f.so' "$sudo_pam" || fail "consenting wires sudo" "$(cat "$sudo_pam")"
+grep -q 'pam_u2f.so' "$polkit_pam" || fail "consenting wires polkit" "$(cat "$polkit_pam")"
+pass "consenting wires sudo and polkit"
+
+[[ -f $lock_pam ]] && grep -q 'required.*pam_u2f' "$lock_pam" ||
+  fail "the lock service is written as required" "$(cat "$lock_pam" 2>/dev/null)"
+grep -qE '^[^#]*pinverification' "$lock_pam" &&
+  fail "the lock service never sets pinverification" "$(cat "$lock_pam")"
+pass "the lock service is written, required, without pinverification"
+
+grep -q 'sudo install -o root -g root -m 0644' "$calls" ||
+  fail "the mapping file is installed as root" "$(cat "$calls")"
+pass "the mapping file is installed as root"
+
+# --- a second key is enrolled alongside the first ----------------------------
+
+attach_keys "Backup Key"
+run BBBBBBBBBBBBBBBBBBBBBBBBBBBB enroll -- "Backup"
+
+[[ $(cut -d: -f1 "$mapping_file") == "tester" ]] ||
+  fail "a second key is appended to the user's line" "$(cat "$mapping_file")"
+(( $(awk -F: '{ print NF }' "$mapping_file") == 3 )) ||
+  fail "a second key is appended to the user's line" "$(cat "$mapping_file")"
+grep -q "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$mapping_file" && grep -q "BBBBBBBBBBBBBBBBBBBBBBBBBBBB" "$mapping_file" ||
+  fail "a second key is appended to the user's line" "$(cat "$mapping_file")"
+pass "a second key is appended to the user's line"
+
+(( $(wc -l <"$label_file") == 2 )) || fail "each key keeps its own name" "$(cat "$label_file")"
+grep -qP '^AAAAAAAAAAAAAAAAAAAAAAAA\tDaily\t' "$label_file" ||
+  fail "each key keeps its own name" "$(cat "$label_file")"
+grep -qP '^BBBBBBBBBBBBBBBBBBBBBBBB\tBackup\t' "$label_file" ||
+  fail "each key keeps its own name" "$(cat "$label_file")"
+pass "each key keeps its own name"
+
+grep -q '^gum confirm' "$calls" &&
+  fail "enrolling again does not ask about wiring twice" "$(cat "$calls")"
+pass "enrolling again does not ask about wiring twice"
+
+(( $(grep -c 'pam_u2f.so' "$sudo_pam") == 1 )) ||
+  fail "enrolling again does not stack a second PAM rule" "$(cat "$sudo_pam")"
+pass "enrolling again does not stack a second PAM rule"
+
+grep -q "Already enrolled" "$output" && grep -q "Daily" "$output" ||
+  fail "the keys already enrolled are listed" "$(cat "$output")"
+pass "the keys already enrolled are listed"
+
+# --- registration refuses to guess between attached keys ---------------------
+
+# pamu2fcfg takes no device argument, so with two keys plugged in there is no
+# way to say which one to enroll -- and that is the normal state of the machine
+# when a backup key is being added.
+before=$(cat "$mapping_file")
+attach_keys "Daily Key" "Backup Key"
+run DDDDDDDDDDDDDDDDDDDDDDDDDDDD enroll -- "Third" || true
+
+grep -q "More than one FIDO2 key" "$output" ||
+  fail "enrollment refuses to guess between two attached keys" "$(cat "$output")"
+[[ $(cat "$mapping_file") == "$before" ]] ||
+  fail "enrollment refuses to guess between two attached keys" "$(cat "$mapping_file")"
+pass "enrollment refuses to guess between two attached keys"
+
+# --- the name defaults to the product name -----------------------------------
+
+reset_state
+attach_keys "TOKEN2 FIDO2 Security Key(0024)"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll "" yes
+
+grep -qF 'TOKEN2 FIDO2 Security Key(0024)' "$label_file" ||
+  fail "an unnamed key falls back to the product name" "$(cat "$label_file")"
+pass "an unnamed key falls back to the product name"
+
+# --- removing one key keeps the rest -----------------------------------------
+
+reset_state
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll yes -- "Daily"
+run BBBBBBBBBBBBBBBBBBBBBBBBBBBB enroll -- "Backup"
+
+run "" remove -- 1
+
+(( $(awk -F: '{ print NF }' "$mapping_file") == 2 )) ||
+  fail "removing one key leaves the others enrolled" "$(cat "$mapping_file")"
+grep -q "BBBBBBBBBBBBBBBBBBBBBBBBBBBB" "$mapping_file" ||
+  fail "removing one key leaves the others enrolled" "$(cat "$mapping_file")"
+grep -q "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$mapping_file" &&
+  fail "removing one key leaves the others enrolled" "$(cat "$mapping_file")"
+pass "removing one key leaves the others enrolled"
+
+grep -q "Backup" "$label_file" || fail "the removed key's name goes with it" "$(cat "$label_file")"
+grep -q "Daily" "$label_file" && fail "the removed key's name goes with it" "$(cat "$label_file")"
+pass "the removed key's name goes with it"
+
+# Revoking a key is not turning the feature off: the keys that are left have to
+# keep authenticating.
+grep -q 'pam_u2f.so' "$sudo_pam" || fail "removing one key leaves PAM alone" "$(cat "$sudo_pam")"
+[[ -f $lock_pam ]] || fail "removing one key leaves PAM alone" "lock service gone"
+pass "removing one key leaves PAM alone"
+
+# --- removing the last key turns the feature off -----------------------------
+
+run "" remove yes -- 1
+
+[[ ! -f $mapping_file ]] || fail "removing the last key clears the enrollment" "$(cat "$mapping_file")"
+grep -q 'pam_u2f.so' "$sudo_pam" && fail "removing the last key unwires sudo" "$(cat "$sudo_pam")"
+[[ ! -f $lock_pam ]] || fail "removing the last key unwires the lock screen" "still present"
+pass "removing the last key clears the enrollment and unwires PAM"
+
+# --- a key registered before names existed -----------------------------------
+
+# Every install that already had FIDO2 set up carries a bare credential with
+# nothing beside it. It still has to list, and still has to be removable.
+reset_state
+mkdir -p "$etc/fido2"
+printf 'tester:LEGACYLEGACYLEGACYLEGACYLEGACY,cHVia2V5,es256,+presence\n' >"$mapping_file"
+
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll yes -- "Daily"
+
+grep -q "unnamed" "$output" ||
+  fail "a key registered before names existed still lists" "$(cat "$output")"
+pass "a key registered before names existed still lists"
+
+run "" remove -- 1
+
+grep -q "LEGACY" "$mapping_file" &&
+  fail "a key registered before names existed still removes" "$(cat "$mapping_file")"
+grep -q "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" "$mapping_file" ||
+  fail "a key registered before names existed still removes" "$(cat "$mapping_file")"
+pass "a key registered before names existed still removes"
+
+# --- state emits the JSON the panel consumes ----------------------------------
+
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run "" state
+
+jq -e . <"$output" >/dev/null || fail "state emits valid JSON" "$(cat "$output")"
+[[ $(jq -r '.credentials | length' <"$output") == 1 ]] ||
+  fail "state lists the enrolled credential" "$(cat "$output")"
+[[ $(jq -r '.tokens[0].alwaysUv' <"$output") == "true" ]] ||
+  fail "state reports the attached key's options" "$(cat "$output")"
+[[ $(jq -r '.tokens[0].pinRetries' <"$output") == 8 ]] ||
+  fail "state reports the PIN retry budget" "$(cat "$output")"
+[[ $(jq -r '.wiring.sudo' <"$output") == "true" ]] ||
+  fail "state reports the PAM wiring" "$(cat "$output")"
+pass "state emits the JSON the panel consumes"
+
+echo
+echo "all management assertions passed"

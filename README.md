@@ -6,7 +6,7 @@ key, on its own service, with a visible mode switch.
 
 ```bash
 omarchy plugin add https://github.com/Erijl/omarchy-fido2-lockscreen-plugin.git --enable
-~/.config/omarchy/plugins/erijl.lock/bin/omarchy-lock-fido2 setup   # writes the PAM service
+~/.config/omarchy/plugins/erijl.lock/bin/omarchy-fido2-suite setup   # writes the PAM service
 omarchy restart shell
 ```
 
@@ -84,7 +84,7 @@ enrolled without one.
 ## When it does not work
 
 ```bash
-~/.config/omarchy/plugins/erijl.lock/bin/omarchy-lock-fido2 doctor
+~/.config/omarchy/plugins/erijl.lock/bin/omarchy-fido2-suite doctor
 ```
 
 Checks the whole chain — plugin enabled, the right lock service running, PAM,
@@ -100,8 +100,8 @@ A fork of `omarchy.lock`, so upstream fixes do not arrive by themselves.
 hashes, making drift a hash compare and a re-base a three-way merge:
 
 ```bash
-bin/omarchy-lock-fido2 doctor   # says when the built-in has moved
-bin/omarchy-lock-fido2 rebase   # merge onto the new built-in
+bin/omarchy-fido2-suite doctor   # says when the built-in has moved
+bin/omarchy-fido2-suite rebase   # merge onto the new built-in
 ./test/all                      # manifest, qmllint, fork-base checks
 ```
 

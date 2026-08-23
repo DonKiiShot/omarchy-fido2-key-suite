@@ -1,0 +1,1079 @@
+#!/bin/bash
+
+# omarchy-fido2-suite -- companion command for the erijl.lock plugin.
+#
+# Credentials:
+#   enroll [label]  enroll a security key (only one may be attached)
+#   list            list enrolled credentials
+#   remove [n]      remove one credential
+#
+# Wiring:
+#   setup           write /etc/pam.d/omarchy-lock-fido2 (lock screen only)
+#   enable          wire the key into sudo, polkit and the lock screen
+#   disable         unwire PAM everywhere, keeping enrollments
+#   repair          fix an installation the stock Omarchy flow already made
+#
+# Health:
+#   status          enrolled keys, PAM wiring, attached authenticators
+#   doctor          explain why the key is or is not being offered
+#   state           the same, as JSON (consumed by the panel and bar widget)
+#   detect          exit 0 if any authenticator is attached
+#   rebase          three-way merge this fork onto a newer built-in lock plugin
+#
+# Nothing here runs by itself. The shell never executes plugin code outside
+# QML, and installing a plugin never asks for privileges -- so every step that
+# touches /etc is a command you run deliberately, and can read first.
+
+set -euo pipefail
+
+PLUGIN_ID="erijl.lock"
+PAM_SERVICE="/etc/pam.d/omarchy-lock-fido2"
+AUTHFILE="/etc/fido2/fido2"
+METAFILE="/etc/fido2/tokens"
+PAM_WIRED_SERVICES=(sudo polkit-1)
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+OMARCHY_LOCK_DIR="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/lock"
+UPSTREAM_FILES=(Service.qml LockView.qml manifest.json)
+
+USER_NAME=${SUDO_USER:-$USER}
+
+ASSUME_YES=0
+FORCE=0
+FAILURES=0
+
+# ------------------------------------------------------------------ output
+
+if [[ -t 1 ]]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RESET=$'\e[0m'
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; RESET=""
+fi
+
+heading() { printf '\n%s%s%s\n' "$BOLD" "$1" "$RESET"; }
+ok()      { printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$1"; }
+warn()    { printf '  %s!%s %s\n' "$YELLOW" "$RESET" "$1"; }
+bad()     { printf '  %s✗%s %s\n' "$RED" "$RESET" "$1"; FAILURES=$((FAILURES + 1)); }
+note()    { printf '    %s%s%s\n' "$DIM" "$1" "$RESET"; }
+fail()    { printf '%somarchy-fido2-suite: %s%s\n' "$RED" "$1" "$RESET" >&2; exit 1; }
+
+interactive() { [[ -t 0 && -t 1 ]]; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  (( ASSUME_YES )) && return 0
+  if have gum; then
+    gum confirm "$1"
+  elif interactive; then
+    local answer
+    read -r -p "$1 [y/N] " answer
+    [[ $answer == [yY]* ]]
+  else
+    fail "refusing to continue without confirmation; pass --yes"
+  fi
+}
+
+ask_input() { # prompt -> stdout (empty on decline)
+  if have gum; then
+    gum input --placeholder "$1" || true
+  elif interactive; then
+    local answer
+    read -r -p "$1: " answer || true
+    printf '%s' "$answer"
+  fi
+}
+
+banner() { # multi-line instruction box that must be the last thing on screen
+  if have gum; then
+    gum style --border rounded --padding "0 2" --margin "0 0 1 0" "$1" 2>/dev/null ||
+      printf '%s\n\n' "$1"
+  else
+    printf '%s\n\n' "$1"
+  fi
+}
+
+require_tools() {
+  local tool missing=()
+  for tool in "$@"; do have "$tool" || missing+=("$tool"); done
+  (( ${#missing[@]} == 0 )) ||
+    fail "missing: ${missing[*]} -- install with: sudo pacman -S --needed pam-u2f libfido2"
+}
+
+# ---------------------------------------------------- authenticator queries
+
+# Devices are listed as "/dev/hidrawN: vendor=... (Product Name)".
+token_nodes() { fido2-token -L 2>/dev/null | cut -d: -f1 | grep . || true; }
+
+# The product name is the trailing parenthesized group, and may itself contain
+# parentheses -- "TOKEN2 FIDO2 Security Key(0024)" -- so split on the first
+# " (" and the final ")" rather than on every paren.
+token_name() {
+  local line
+  line=$(fido2-token -L 2>/dev/null | grep -m1 "^$1:" || true)
+  [[ $line == *" ("* ]] || return 0
+  line=${line#* (}
+  printf '%s\n' "${line%)}"
+}
+
+# CTAP options come back as one comma-separated line, where a leading "no"
+# means the option is present and false:
+#
+#   options: rk, up, noplat, alwaysUv, credMgmt, clientPin, nomakeCredUvNotRqd
+#
+# so "clientPin" means a PIN is set and "noclientPin" means the key supports
+# one but none has been configured. Absent means unsupported entirely.
+token_option() {
+  local name=$1 info=$2 opt
+  while IFS= read -r opt; do
+    [[ $opt == "$name" ]] && { echo true; return; }
+    [[ $opt == "no$name" ]] && { echo false; return; }
+  done < <(sed -n 's/^options:[[:space:]]*//p' <<<"$info" | tr ',' '\n' | tr -d ' ')
+  echo absent
+}
+
+token_field() { sed -n "s/^$2:[[:space:]]*//p" <<<"$1" | head -1; }
+
+# Which pamu2fcfg flags this authenticator actually needs. Getting this wrong
+# in either direction is what breaks things: omit the flag on an alwaysUv key
+# and every assertion is refused before the key is armed; force it on a key
+# with no PIN and enrollment fails outright.
+registration_flags() {
+  local info=$1 pin uv always
+  pin=$(token_option clientPin "$info")
+  uv=$(token_option uv "$info")
+  always=$(token_option alwaysUv "$info")
+
+  if [[ $uv == true ]]; then
+    echo "-V" # built-in verification (biometric); the key decides how
+  elif [[ $pin == true ]]; then
+    echo "-N" # PIN verification
+  elif [[ $always == true ]]; then
+    return 1 # UV mandatory but nothing configured to satisfy it
+  fi
+}
+
+# ------------------------------------------------------------- mapping file
+
+user_line() { [[ -f $AUTHFILE ]] && grep "^${USER_NAME}:" "$AUTHFILE" || true; }
+
+# Everything after "user:" split back into one credential per line.
+credentials() {
+  local line
+  line=$(user_line)
+  [[ -n $line ]] || return 0
+  cut -d: -f2- <<<"$line" | tr ':' '\n' | grep . || true
+}
+
+credential_count() { credentials | wc -l; }
+
+# The key handle is unique per credential and stable, so its head makes a
+# usable primary key for the label sidecar. Indexes would shift on removal.
+cred_key() { cut -d, -f1 <<<"$1" | cut -c1-24; }
+cred_flags() { cut -d, -f4 <<<"$1"; }
+
+label_for() {
+  local key=$1 label=""
+  [[ -f $METAFILE ]] && label=$(awk -F'\t' -v k="$key" '$1 == k {print $2}' "$METAFILE" | head -1)
+  echo "${label:-unnamed}"
+}
+
+meta_field() {
+  local key=$1 col=$2
+  [[ -f $METAFILE ]] || return 0
+  awk -F'\t' -v k="$key" -v c="$col" '$1 == k {print $c}' "$METAFILE" | head -1
+}
+
+# install(1) copies content and applies ownership in one step, so the file
+# never exists at its final path owned by the invoking user. This is the bug
+# that leaves /etc/fido2/fido2 writable by an unprivileged account in the
+# stock flow: `pamu2fcfg > /tmp/f && sudo mv /tmp/f /etc/...` relinks, and mv
+# preserves the original owner. Mode 0644 is deliberate -- the lock screen
+# runs PAM inside a user process and has to read this. It holds a credential
+# ID and a public key; there is nothing secret in it.
+install_root_file() {
+  local content=$1 dest=$2 tmp
+  tmp=$(mktemp)
+  printf '%s\n' "$content" >"$tmp"
+  sudo install -o root -g root -m 0644 "$tmp" "$dest"
+  rm -f "$tmp"
+}
+
+write_mapfile() {
+  local new_user_line=$1 others=""
+  sudo mkdir -p "$(dirname "$AUTHFILE")"
+  [[ -f $AUTHFILE ]] && others=$(grep -v "^${USER_NAME}:" "$AUTHFILE" || true)
+
+  local content=$new_user_line
+  [[ -n $others ]] && content=$(printf '%s\n%s' "$others" "$new_user_line")
+  install_root_file "$content" "$AUTHFILE"
+}
+
+write_meta() { install_root_file "$1" "$METAFILE"; }
+
+# --------------------------------------------------------------- PAM wiring
+
+# No pinverification= / userverification= anywhere on purpose. pam_u2f's
+# parse_opts() ORs the module option with the credential's own flags:
+#
+#   if (cfg->userpresence == 1 || strstr(attr, "+presence")) opts->up = TRUE;
+#
+# so a module-wide pinverification=1 would force a PIN onto every key,
+# including one that has none. Recording the requirement per credential at
+# registration time is what lets a PIN-mandatory key and a touch-only key
+# coexist in the same mapping file.
+#
+# The cue prompt is the only message pam_u2f lets us word. Its PIN prompt
+# ("Please enter the PIN: ") is a string literal in the module and comes FIRST
+# -- do_authentication() collects the PIN before emitting the cue -- so the
+# [sudo] marker lands on the touch line, not on the first thing you see.
+#
+# Escaping: PAM's bracket convention needs a literal "]" written as "\]" inside
+# a bracketed argument. From pam.conf(5):  [..[..\]..]  -->  ..[..]..
+pam_line() {
+  case "$1" in
+    sudo) echo "auth       sufficient  pam_u2f.so authfile=$AUTHFILE cue [cue_prompt=[sudo\] touch your security key]" ;;
+    *) echo "auth       sufficient  pam_u2f.so authfile=$AUTHFILE cue [cue_prompt=Touch your security key]" ;;
+  esac
+}
+
+pam_path() { echo "/etc/pam.d/$1"; }
+
+pam_module_path() {
+  local dir
+  for dir in /usr/lib/security /usr/lib64/security /lib/security /usr/lib/x86_64-linux-gnu/security; do
+    [[ -f "$dir/pam_u2f.so" ]] && { echo "$dir/pam_u2f.so"; return 0; }
+  done
+  return 1
+}
+
+pam_service_body() {
+  cat <<PAM
+#%PAM-1.0
+# Security-key unlock for the Omarchy lock screen (plugin: erijl.lock).
+#
+# Its own service on purpose. Adding \`sufficient pam_u2f.so\` to
+# omarchy-lock-password instead would send every mistyped password to the key
+# as a PIN attempt, and a key has only eight of those before it locks itself
+# out and needs a factory reset that destroys every credential on it.
+#
+# \`required\` with no pam_unix fallback: the way back to a password is the mode
+# switch in the UI, not a silent fall-through.
+#
+# No pinverification=1 here. pam_u2f ORs that module option with the
+# per-credential flag, so setting it would force a PIN onto keys registered
+# without one. Verification requirements belong on the credential.
+auth       required    pam_u2f.so authfile=$AUTHFILE cue [cue_prompt=Touch your security key]
+account    include     system-local-login
+PAM
+}
+
+# Insert above the first real auth rule rather than blindly at line 1, so the
+# "#%PAM-1.0" header keeps its place and the file still reads top-down.
+insert_pam_line() {
+  local file=$1 line=$2 tmp
+  tmp=$(mktemp)
+  awk -v line="$line" '
+    !done && /^[[:space:]]*auth[[:space:]]/ { print line; done = 1 }
+    { print }
+    END { if (!done) print line }
+  ' "$file" >"$tmp"
+  sudo install -o root -g root -m 0644 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+strip_pam_line() {
+  local file=$1
+  [[ -f $file ]] || return 0
+  grep -q 'pam_u2f\.so' "$file" || return 0
+  sudo sed -i '/pam_u2f\.so/d' "$file"
+}
+
+pam_wired() { [[ -f $(pam_path "$1") ]] && grep -q 'pam_u2f\.so' "$(pam_path "$1")"; }
+lock_wired() { [[ -f $PAM_SERVICE ]] && grep -q 'pam_u2f\.so' "$PAM_SERVICE"; }
+
+write_lock_service() { install_root_file "$(pam_service_body)" "$PAM_SERVICE"; }
+
+wire_system_pam() { # sudo and polkit; the lock service is written separately
+  local service file
+  for service in "${PAM_WIRED_SERVICES[@]}"; do
+    file=$(pam_path "$service")
+
+    if [[ ! -f $file ]]; then
+      # polkit-1 is absent on some installs; write the whole stack the way the
+      # stock setup script does.
+      install_root_file "$(
+        cat <<EOF
+$(pam_line "$service")
+auth       required    pam_unix.so
+
+account    required    pam_unix.so
+password   required    pam_unix.so
+session    required    pam_unix.so
+EOF
+      )" "$file"
+      continue
+    fi
+
+    strip_pam_line "$file"
+    insert_pam_line "$file" "$(pam_line "$service")"
+  done
+}
+
+unwire_all_pam() {
+  local service
+  for service in "${PAM_WIRED_SERVICES[@]}"; do
+    strip_pam_line "$(pam_path "$service")"
+  done
+  sudo rm -f "$PAM_SERVICE"
+}
+
+# --------------------------------------------------------------- credentials
+
+cmd_enroll() {
+  local label=${1:-}
+  require_tools fido2-token pamu2fcfg
+
+  local nodes count
+  nodes=$(token_nodes)
+  count=$(grep -c . <<<"$nodes" || true)
+
+  [[ -n $nodes ]] || fail "no FIDO2 authenticator detected -- plug one in and try again"
+
+  # pamu2fcfg takes no device argument -- it registers against whichever key it
+  # finds -- so enrolling with several attached would silently pick one. That
+  # is exactly the situation when adding a backup key next to the daily one.
+  if (( count > 1 )); then
+    echo "More than one FIDO2 key is attached."
+    note "pamu2fcfg cannot be told which one to use. Unplug all but the key you"
+    note "want to enroll, then run this again."
+    exit 1
+  fi
+
+  local dev info flags
+  dev=$(head -1 <<<"$nodes")
+  info=$(fido2-token -I "$dev") || fail "could not interrogate $dev"
+
+  if ! flags=$(registration_flags "$info"); then
+    bad "this key enforces alwaysUv but has no PIN set, so nothing can satisfy it"
+    note "set one first:  fido2-token -S $dev"
+    exit 1
+  fi
+
+  if (( $(credential_count) > 0 )); then
+    echo "Already enrolled for $USER_NAME:"
+    cmd_list | sed 's/^/  /'
+    echo
+  fi
+
+  heading "Enrolling $(token_name "$dev")"
+
+  # Ask for the label first. pamu2fcfg owns the terminal from the moment it
+  # starts -- it prints its own PIN prompt and then blocks on the touch with no
+  # further output -- so anything asked afterwards would interleave with it, and
+  # anything explained beforehand would have scrolled away by the time it
+  # mattered. The label goes first, the instructions go last.
+  if [[ -z $label ]]; then
+    label=$(ask_input "Name for this key (e.g. 'Token2 daily')")
+    [[ -n $label ]] || label="$(token_name "$dev")"
+  fi
+
+  # pamu2fcfg gives no cue at the point it starts waiting for the touch, so the
+  # steps have to be on screen before it takes over. Numbered, because the PIN
+  # prompt that follows is its own and looks like the whole story.
+  local steps
+  case "$flags" in
+    -N) steps=$'1.  Type your security key PIN below, then press Enter\n2.  The key will start blinking\n3.  Touch it  -- there is no further prompt' ;;
+    -V) steps=$'1.  Follow the key\'s own verification prompt\n2.  The key will start blinking\n3.  Touch it  -- there is no further prompt' ;;
+    *) steps=$'1.  The key will start blinking\n2.  Touch it  -- there is no further prompt' ;;
+  esac
+  banner "$steps"
+
+  # -n prints only ":khandle,pubkey,cose,+flags" with no trailing newline, so
+  # credentials concatenate directly onto the user's line.
+  local tail
+  # shellcheck disable=SC2086
+  tail=$(pamu2fcfg -n $flags) || fail "registration failed or was cancelled"
+  [[ $tail == :* ]] || fail "unexpected pamu2fcfg output: $tail"
+
+  local existing new_line
+  existing=$(user_line)
+  if [[ -n $existing ]]; then
+    new_line="${existing}${tail}"
+  else
+    new_line="${USER_NAME}${tail}"
+  fi
+  write_mapfile "$new_line"
+
+  local key meta
+  key=$(cred_key "${tail#:}")
+  meta=""
+  [[ -f $METAFILE ]] && meta=$(cat "$METAFILE")
+  meta=$(printf '%s\n%s\t%s\t%s\t%s' "$meta" \
+    "$key" "$label" "$(token_field "$info" aaguid)" "$(date -I)")
+  write_meta "$(grep . <<<"$meta")"
+
+  # The lock screen is this plugin's job, so its PAM service is always kept
+  # current. sudo and polkit are the user's call, asked once -- rewiring what
+  # is already wired keeps the module line in sync without asking again.
+  write_lock_service
+  if pam_wired sudo || pam_wired polkit-1; then
+    wire_system_pam
+  elif confirm "Also protect sudo and polkit with the key?"; then
+    wire_system_pam
+  fi
+
+  echo
+  ok "enrolled '$label'"
+  note "verification recorded for this credential: $(cred_flags "${tail#:}")"
+  echo
+  note "test it now, keeping this terminal open:  sudo -k true"
+}
+
+cmd_list() {
+  local porcelain=0 n=0 cred key
+  [[ ${1:-} == "--porcelain" ]] && porcelain=1
+
+  if [[ $(credential_count) -eq 0 ]]; then
+    (( porcelain )) || echo "No security keys enrolled for $USER_NAME."
+    return 0
+  fi
+
+  (( porcelain )) || printf '%-3s %-22s %-18s %s\n' "#" "LABEL" "VERIFICATION" "ENROLLED"
+  while IFS= read -r cred; do
+    n=$((n + 1))
+    key=$(cred_key "$cred")
+    if (( porcelain )); then
+      # Tab-separated; labels may contain spaces, so a column-aligned table is
+      # not parseable.
+      printf '%s\t%s\t%s\t%s\n' \
+        "$n" "$(label_for "$key")" "$(cred_flags "$cred")" "$(meta_field "$key" 4)"
+    else
+      printf '%-3s %-22s %-18s %s\n' \
+        "$n" "$(label_for "$key")" "$(cred_flags "$cred")" "$(meta_field "$key" 4)"
+    fi
+  done < <(credentials)
+}
+
+cmd_remove_credential() {
+  local target=${1:-}
+  local total
+  total=$(credential_count)
+  (( total > 0 )) || fail "no security keys enrolled for $USER_NAME"
+
+  if [[ -z $target ]]; then
+    cmd_list
+    echo
+    target=$(ask_input "Number to remove")
+    [[ -n $target ]] || exit 0
+  fi
+
+  [[ $target =~ ^[0-9]+$ ]] || fail "expected a number, got '$target'"
+  (( target >= 1 && target <= total )) || fail "no such key: $target"
+
+  if (( total == 1 )); then
+    warn "this is the only enrolled key"
+    confirm "Remove it and fall back to password-only?" || exit 0
+  fi
+
+  local n=0 cred key kept=() removed_key=""
+  while IFS= read -r cred; do
+    n=$((n + 1))
+    key=$(cred_key "$cred")
+    if (( n == target )); then
+      removed_key=$key
+    else
+      kept+=(":$cred")
+    fi
+  done < <(credentials)
+
+  if (( ${#kept[@]} == 0 )); then
+    # No credentials left: drop the user's line entirely and unwire PAM,
+    # rather than leaving an empty "user:" that pam_u2f would reject.
+    local others=""
+    [[ -f $AUTHFILE ]] && others=$(grep -v "^${USER_NAME}:" "$AUTHFILE" || true)
+    if [[ -n $others ]]; then
+      install_root_file "$others" "$AUTHFILE"
+    else
+      sudo rm -f "$AUTHFILE"
+    fi
+    unwire_all_pam
+    ok "removed -- FIDO2 authentication is now off; password only"
+  else
+    write_mapfile "${USER_NAME}$(printf '%s' "${kept[@]}")"
+    ok "removed"
+  fi
+
+  if [[ -n $removed_key && -f $METAFILE ]]; then
+    local remaining
+    remaining=$(awk -F'\t' -v k="$removed_key" '$1 != k' "$METAFILE")
+    if [[ -n $remaining ]]; then
+      write_meta "$remaining"
+    else
+      sudo rm -f "$METAFILE"
+    fi
+  fi
+}
+
+# ------------------------------------------------------------------- wiring
+
+cmd_setup() {
+  local module
+  if ! module=$(pam_module_path); then
+    bad "pam_u2f.so is not installed"
+    note "sudo pacman -S --needed pam-u2f libfido2"
+    exit 1
+  fi
+  ok "pam_u2f.so found at $module"
+
+  if [[ -f $PAM_SERVICE ]]; then
+    if (( ! FORCE )) && grep -q 'pam_u2f\.so' "$PAM_SERVICE"; then
+      ok "$PAM_SERVICE already exists and loads pam_u2f"
+      note "rewrite it with: $0 setup --force"
+      echo
+      cmd_doctor
+      return
+    fi
+
+    echo "$PAM_SERVICE already exists. The difference from what this would write:"
+    echo
+    diff -u "$PAM_SERVICE" <(pam_service_body) || true
+    echo
+    confirm "Replace $PAM_SERVICE?" || fail "aborted"
+  fi
+
+  echo "Writing $PAM_SERVICE (this is the sudo prompt)..."
+  write_lock_service
+  ok "wrote $PAM_SERVICE"
+
+  echo
+  cmd_doctor
+}
+
+cmd_enable() {
+  (( $(credential_count) > 0 )) || fail "no keys enrolled -- run: $0 enroll"
+  write_lock_service
+  wire_system_pam
+  ok "FIDO2 wired into sudo, polkit and the lock screen"
+}
+
+cmd_disable() {
+  unwire_all_pam
+  ok "FIDO2 removed from sudo, polkit and the lock screen"
+  note "enrolled credentials are kept in $AUTHFILE; re-enable with: $0 enable"
+  echo
+  echo "The plugin itself is separate:"
+  note "omarchy plugin disable $PLUGIN_ID   # back to the built-in lock screen"
+  note "omarchy plugin remove  $PLUGIN_ID   # and take the files away too"
+}
+
+# Bring an installation made by the stock omarchy-setup-security-fido2 up to
+# something that works, without making the user re-enroll if their credential
+# is already usable.
+cmd_repair() {
+  [[ -f $AUTHFILE ]] || fail "nothing to repair: $AUTHFILE does not exist -- run: $0 enroll"
+
+  local owner
+  owner=$(stat -c '%U:%G' "$AUTHFILE")
+  if [[ $owner != "root:root" ]]; then
+    warn "mapping file was owned by $owner; reinstalling as root:root"
+    install_root_file "$(cat "$AUTHFILE")" "$AUTHFILE"
+  fi
+
+  write_lock_service
+  wire_system_pam
+  ok "PAM services rewired"
+
+  # A credential registered by the stock script carries "+presence" alone. On
+  # an authenticator that mandates UV, that credential can never assert, and no
+  # amount of PAM configuration fixes it -- it has to be registered again.
+  local cred stale=0
+  while IFS= read -r cred; do
+    [[ $(cred_flags "$cred") == "+presence" ]] && stale=1
+  done < <(credentials)
+
+  if (( stale )); then
+    local dev info
+    dev=$(head -1 <<<"$(token_nodes)")
+    if [[ -n $dev ]] && info=$(fido2-token -I "$dev" 2>/dev/null); then
+      if [[ $(token_option alwaysUv "$info") == true ]]; then
+        echo
+        warn "a presence-only credential is enrolled, but the attached key enforces alwaysUv"
+        note "that credential cannot ever authenticate. Re-enroll it:"
+        note "  $0 remove"
+        note "  $0 enroll"
+      fi
+    fi
+  fi
+}
+
+# ------------------------------------------------------------------- health
+
+cmd_detect() { [[ -n $(token_nodes) ]]; }
+
+cmd_status() {
+  heading "Enrolled for $USER_NAME"
+  cmd_list | sed 's/^/  /'
+
+  heading "Mapping file"
+  if [[ -f $AUTHFILE ]]; then
+    local owner mode
+    owner=$(stat -c '%U:%G' "$AUTHFILE")
+    mode=$(stat -c '%a' "$AUTHFILE")
+    printf '  %s  %s  %s\n' "$AUTHFILE" "$owner" "$mode"
+    [[ $owner == "root:root" ]] || warn "not owned by root -- run: $0 repair"
+  else
+    note "$AUTHFILE does not exist"
+  fi
+
+  heading "PAM wiring"
+  local service
+  for service in "${PAM_WIRED_SERVICES[@]}"; do
+    if pam_wired "$service"; then
+      printf '  %-22s wired\n' "$service"
+    else
+      printf '  %-22s %snot wired%s\n' "$service" "$DIM" "$RESET"
+    fi
+  done
+  if lock_wired; then
+    printf '  %-22s wired\n' "lock screen"
+  else
+    printf '  %-22s %snot wired%s\n' "lock screen" "$DIM" "$RESET"
+  fi
+
+  heading "Attached authenticators"
+  local dev info
+  if [[ -z $(token_nodes) ]]; then
+    note "none"
+  else
+    while IFS= read -r dev; do
+      info=$(fido2-token -I "$dev" 2>/dev/null) || continue
+      printf '  %s  %s\n' "$dev" "$(token_name "$dev")"
+      printf '    %salwaysUv=%s  clientPin=%s  uv=%s  pin retries=%s%s\n' "$DIM" \
+        "$(token_option alwaysUv "$info")" \
+        "$(token_option clientPin "$info")" \
+        "$(token_option uv "$info")" \
+        "$(token_field "$info" 'pin retries')" "$RESET"
+    done < <(token_nodes)
+  fi
+  echo
+}
+
+# One call, everything the panel and the bar widget need. Reading CTAP options
+# is a hidraw round-trip per key, so the QML side calls this on open and on
+# device change rather than polling.
+cmd_state() {
+  require_tools jq
+
+  local creds_json="[]" n=0 cred key
+  while IFS= read -r cred; do
+    n=$((n + 1))
+    key=$(cred_key "$cred")
+    creds_json=$(jq -c --argjson i "$n" --arg label "$(label_for "$key")" \
+      --arg flags "$(cred_flags "$cred")" --arg date "$(meta_field "$key" 4)" \
+      '. + [{index: $i, label: $label, flags: $flags, enrolled: $date}]' <<<"$creds_json")
+  done < <(credentials)
+
+  local tokens_json="[]" dev info
+  while IFS= read -r dev; do
+    [[ -n $dev ]] || continue
+    info=$(fido2-token -I "$dev" 2>/dev/null) || continue
+    tokens_json=$(jq -c --arg dev "$dev" --arg name "$(token_name "$dev")" \
+      --arg alwaysUv "$(token_option alwaysUv "$info")" \
+      --arg clientPin "$(token_option clientPin "$info")" \
+      --arg uv "$(token_option uv "$info")" \
+      --arg retries "$(token_field "$info" 'pin retries')" \
+      '. + [{device: $dev, name: $name, alwaysUv: $alwaysUv, clientPin: $clientPin,
+             uv: $uv, pinRetries: ($retries | if . == "" then null else tonumber end)}]' \
+      <<<"$tokens_json")
+  done < <(token_nodes)
+
+  local authfile_owner=""
+  [[ -f $AUTHFILE ]] && authfile_owner=$(stat -c '%U:%G' "$AUTHFILE")
+
+  jq -n \
+    --arg user "$USER_NAME" \
+    --argjson credentials "$creds_json" \
+    --argjson tokens "$tokens_json" \
+    --arg authfileOwner "$authfile_owner" \
+    --argjson lock "$(lock_wired && echo true || echo false)" \
+    --argjson sudo "$(pam_wired sudo && echo true || echo false)" \
+    --argjson polkit "$(pam_wired polkit-1 && echo true || echo false)" \
+    '{user: $user, credentials: $credentials, tokens: $tokens,
+      authfileOwner: $authfileOwner,
+      wiring: {lockScreen: $lock, sudo: $sudo, polkit: $polkit}}'
+}
+
+# ------------------------------------------------------------------- doctor
+
+check_pam() {
+  heading "PAM service"
+
+  if [[ ! -f $PAM_SERVICE ]]; then
+    bad "$PAM_SERVICE is missing -- the lock screen cannot offer the key"
+    note "$0 setup"
+    return
+  fi
+  ok "$PAM_SERVICE exists"
+
+  if grep -q 'pam_u2f\.so' "$PAM_SERVICE"; then
+    local authfile
+    authfile=$(grep -oP 'authfile=\K[^ ]+' "$PAM_SERVICE" | head -1)
+    ok "loads pam_u2f with authfile=${authfile:-<default>}"
+    [[ -n $authfile && $authfile != "$AUTHFILE" ]] &&
+      warn "that is not $AUTHFILE, so the checks below may be looking at the wrong file"
+  else
+    bad "$PAM_SERVICE does not load pam_u2f.so"
+  fi
+
+  if grep -qE '^\s*auth\s+sufficient\s+pam_u2f' "$PAM_SERVICE"; then
+    warn "pam_u2f is 'sufficient' here; 'required' is what this plugin expects"
+  fi
+
+  if grep -qE '^[^#]*pinverification=1' "$PAM_SERVICE"; then
+    warn "pinverification=1 is set module-wide"
+    note "pam_u2f ORs it with the per-credential flag, forcing a PIN onto keys registered without one"
+  fi
+
+  local owner
+  owner=$(stat -c '%U:%G %a' "$PAM_SERVICE")
+  if [[ $owner == "root:root 644" ]]; then
+    ok "owned root:root, mode 644"
+  else
+    warn "unexpected ownership/mode: $owner (want root:root 644)"
+  fi
+
+  local service
+  for service in "${PAM_WIRED_SERVICES[@]}"; do
+    if pam_wired "$service"; then
+      ok "$service is wired"
+    else
+      warn "$service is not wired for the key"
+      note "$0 enable"
+    fi
+  done
+}
+
+check_credentials() {
+  heading "Credentials"
+
+  if [[ ! -f $AUTHFILE ]]; then
+    bad "$AUTHFILE does not exist -- no key is enrolled"
+    note "$0 enroll"
+    return
+  fi
+
+  local owner
+  owner=$(stat -c '%U:%G' "$AUTHFILE")
+  if [[ $owner == "root:root" ]]; then
+    ok "$AUTHFILE owned root:root"
+  else
+    warn "$AUTHFILE is owned by $owner, not root:root"
+    note "anyone who can write it can enroll their own key: $0 repair"
+  fi
+
+  local line
+  if ! line=$(grep -m1 "^$USER_NAME:" "$AUTHFILE"); then
+    bad "no credential for '$USER_NAME' in $AUTHFILE"
+    note "the file exists but this account has no key enrolled: $0 enroll"
+    return
+  fi
+
+  local -a creds
+  IFS=':' read -r -a creds <<<"$line"
+  local count=$((${#creds[@]} - 1))
+  (( count > 0 )) && ok "$count credential(s) enrolled for $USER_NAME" || bad "no credential fields for $USER_NAME"
+
+  CREDENTIALS_FOUND=$count
+  CREDENTIALS_WANT_PIN=0
+  local index options key
+  for (( index = 1; index < ${#creds[@]}; index++ )); do
+    options=$(cut -d, -f4 <<<"${creds[index]}")
+    key=$(cred_key "${creds[index]}")
+    printf '    %s#%d %s -- %s%s\n' "$DIM" "$index" "$(label_for "$key")" "${options:-<none>}" "$RESET"
+    [[ $options == *"+pin"* || $options == *"+verification"* ]] && CREDENTIALS_WANT_PIN=1
+  done
+
+  (( count == 1 )) &&
+    warn "only one key is enrolled -- a lost key means password-only until you enroll another"
+}
+
+check_hardware() {
+  heading "Authenticators"
+
+  if ! have fido2-token; then
+    bad "fido2-token is not installed (package: libfido2)"
+    return
+  fi
+
+  local -a devices
+  mapfile -t devices < <(token_nodes)
+
+  if (( ${#devices[@]} == 0 )); then
+    warn "no authenticator attached right now"
+    note "that is fine -- the lock screen says so and waits, and notices one plugged in later"
+    return
+  fi
+
+  TOKEN_ALWAYS_UV=0
+  local device info
+  for device in "${devices[@]}"; do
+    info=$(fido2-token -I "$device" 2>/dev/null || true)
+    if [[ -z $info ]]; then
+      warn "$device did not answer fido2-token -I"
+      continue
+    fi
+
+    local traits=()
+    [[ $(token_option alwaysUv "$info") == true ]] && { traits+=("alwaysUv"); TOKEN_ALWAYS_UV=1; }
+    [[ $(token_option clientPin "$info") == true ]] && traits+=("PIN set")
+    [[ $(token_option clientPin "$info") == false ]] && traits+=("no PIN set")
+
+    local retries
+    retries=$(token_field "$info" 'pin retries')
+    [[ -n $retries ]] && traits+=("$retries PIN retries left")
+
+    ok "$device -- ${traits[*]:-no notable options}"
+    [[ -n $retries && $retries -le 3 ]] &&
+      warn "only $retries PIN retries left on $device; at 0 the key factory-resets"
+  done
+}
+
+check_pin_policy() {
+  # The failure this suite exists next to: a key that demands verification for
+  # every assertion, against a credential registered without any. The stock
+  # Omarchy setup cannot produce the right credential; this suite's enroll can.
+  (( ${TOKEN_ALWAYS_UV:-0} )) || return 0
+  (( ${CREDENTIALS_WANT_PIN:-0} )) && return 0
+
+  heading "The alwaysUv mismatch"
+  bad "an attached key enforces alwaysUv, but no enrolled credential records a PIN"
+  note "pam_u2f asks for an assertion with verification off, the key refuses it before"
+  note "it ever lights up, and the unlock fails without a single blink."
+  note ""
+  note "Re-enroll with this suite, which reads the key's own requirements:"
+  note "  $0 enroll"
+}
+
+check_plugin() {
+  heading "Plugin"
+
+  if ! have omarchy-plugin-list; then
+    warn "omarchy-plugin-list not found; skipping plugin checks"
+    return
+  fi
+
+  local entry
+  entry=$(omarchy-plugin-list --json 2>/dev/null | jq -c --arg id "$PLUGIN_ID" 'map(select(.id == $id))[0] // empty' || true)
+
+  if [[ -z $entry ]]; then
+    bad "$PLUGIN_ID is not installed"
+    note "omarchy plugin add https://github.com/Erijl/omarchy-fido2-lockscreen-plugin.git --enable"
+    return
+  fi
+  ok "$PLUGIN_ID is installed"
+
+  if [[ $(jq -r '.enabled' <<<"$entry") == "true" ]]; then
+    ok "enabled"
+  else
+    bad "installed but not enabled -- the built-in lock screen is still in charge"
+    note "omarchy plugin enable $PLUGIN_ID"
+  fi
+
+  local status
+  status=$(omarchy-shell lock status 2>/dev/null || true)
+  if ! jq -e . >/dev/null 2>&1 <<<"$status"; then
+    warn "the shell did not answer 'lock status'"
+    note "is omarchy-shell running? try: omarchy restart shell"
+    return
+  fi
+
+  if [[ $(jq -r 'has("fido2Pam")' <<<"$status") != "true" ]]; then
+    bad "the running lock service has no FIDO2 support"
+    note "the built-in plugin is loaded, not this one; omarchy restart shell"
+    return
+  fi
+
+  printf '    %s%s%s\n' "$DIM" \
+    "$(jq -r '"pam=\(.fido2Pam)  enrolled=\(.fido2Enrolled)  keyAttached=\(.fido2Token)  defaultMode=\(.defaultMode)"' <<<"$status")" \
+    "$RESET"
+
+  [[ $(jq -r '.fido2 // false' <<<"$status") == "true" ]] &&
+    ok "the lock screen will offer the key" ||
+    warn "the lock screen will not offer the key yet (see above)"
+}
+
+check_upstream() {
+  heading "Upstream"
+
+  local base="$PLUGIN_DIR/upstream/BASE"
+  if [[ ! -f $base ]]; then
+    warn "upstream/BASE is missing; cannot tell whether this fork is current"
+    return
+  fi
+
+  local recorded_version
+  recorded_version=$(grep -oP '^omarchy_version=\K.*' "$base" || echo "unknown")
+  local installed_version="unknown"
+  [[ -f "${OMARCHY_PATH:-/usr/share/omarchy}/version" ]] &&
+    installed_version=$(<"${OMARCHY_PATH:-/usr/share/omarchy}/version")
+
+  if [[ ! -d $OMARCHY_LOCK_DIR ]]; then
+    warn "$OMARCHY_LOCK_DIR not found; skipping the drift check"
+    return
+  fi
+
+  local drift=0 file recorded current
+  for file in "${UPSTREAM_FILES[@]}"; do
+    recorded=$(grep -oP "^sha256_$file=\K.*" "$base" || true)
+    current=$(sha256sum "$OMARCHY_LOCK_DIR/$file" 2>/dev/null | cut -d' ' -f1)
+    [[ -n $recorded && $recorded == "$current" ]] || { drift=1; warn "$file has changed upstream"; }
+  done
+
+  if (( drift )); then
+    bad "Omarchy's lock plugin has moved since this fork was taken ($recorded_version -> $installed_version)"
+    note "this fork is missing whatever changed. Look, then merge:"
+    note "  diff -u $PLUGIN_DIR/upstream/Service.qml $OMARCHY_LOCK_DIR/Service.qml"
+    note "  $0 rebase"
+  else
+    ok "fork is current with the installed lock plugin ($recorded_version)"
+  fi
+}
+
+cmd_doctor() {
+  check_plugin
+  check_pam
+  check_credentials
+  check_hardware
+  check_pin_policy
+  check_upstream
+
+  echo
+  if (( FAILURES )); then
+    printf '%s%d problem(s) above.%s\n' "$RED" "$FAILURES" "$RESET"
+    return 1
+  fi
+  printf '%sAll good.%s\n' "$GREEN" "$RESET"
+}
+
+# ------------------------------------------------------------------ rebase
+
+cmd_rebase() {
+  local base="$PLUGIN_DIR/upstream/BASE"
+  [[ -f $base ]] || fail "upstream/BASE is missing"
+  [[ -d $OMARCHY_LOCK_DIR ]] || fail "$OMARCHY_LOCK_DIR not found"
+  have git || fail "git is required"
+
+  git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1 ||
+    fail "$PLUGIN_DIR is not a git checkout; rebase writes conflict markers and needs an undo"
+  [[ -z $(git -C "$PLUGIN_DIR" status --porcelain) ]] ||
+    fail "working tree is dirty; commit or stash first so this is undoable"
+
+  local file recorded current conflicts=0 changed=0
+  for file in "${UPSTREAM_FILES[@]}"; do
+    recorded=$(grep -oP "^sha256_$file=\K.*" "$base" || true)
+    current=$(sha256sum "$OMARCHY_LOCK_DIR/$file" | cut -d' ' -f1)
+
+    if [[ $recorded == "$current" ]]; then
+      ok "$file unchanged upstream"
+      continue
+    fi
+
+    changed=1
+    if git merge-file -L "this fork" -L "fork base" -L "new upstream" \
+      "$PLUGIN_DIR/$file" "$PLUGIN_DIR/upstream/$file" "$OMARCHY_LOCK_DIR/$file"; then
+      ok "$file merged cleanly"
+    else
+      conflicts=1
+      warn "$file merged with conflicts -- resolve the <<<<<<< markers by hand"
+    fi
+    cp -- "$OMARCHY_LOCK_DIR/$file" "$PLUGIN_DIR/upstream/$file"
+  done
+
+  if (( ! changed )); then
+    echo
+    echo "Nothing to do -- the fork base already matches the installed lock plugin."
+    return 0
+  fi
+
+  local version="unknown" commit="unknown"
+  [[ -f "${OMARCHY_PATH:-/usr/share/omarchy}/version" ]] &&
+    version=$(<"${OMARCHY_PATH:-/usr/share/omarchy}/version")
+  commit=$(git ls-remote https://github.com/basecamp/omarchy quattro 2>/dev/null | cut -f1 || true)
+  [[ -n $commit ]] || commit="unknown (offline; taken from the installed package)"
+
+  {
+    sed -e "s/^omarchy_version=.*/omarchy_version=$version/" \
+      -e "s|^upstream_commit=.*|upstream_commit=$commit|" \
+      -e "s/^forked_on=.*/forked_on=$(date -I)/" \
+      -e "/^sha256_/d" "$base"
+    for file in "${UPSTREAM_FILES[@]}"; do
+      echo "sha256_$file=$(sha256sum "$PLUGIN_DIR/upstream/$file" | cut -d' ' -f1)"
+    done
+  } >"$base.new"
+  mv -- "$base.new" "$base"
+  ok "upstream/ and upstream/BASE updated to $version"
+
+  echo
+  echo "Next:"
+  (( conflicts )) && note "resolve conflict markers, they are in the plugin's own QML"
+  note "$PLUGIN_DIR/test/all"
+  note "lock the screen and try both factors before committing"
+  note "git -C $PLUGIN_DIR diff"
+}
+
+# ------------------------------------------------------------------ main
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-fido2-suite <command> [--yes] [--force]
+
+Credentials
+  enroll [label]  enroll a security key (only one may be attached)
+  list            list enrolled credentials  (--porcelain for TSV)
+  remove [n]      remove one credential
+
+Wiring
+  setup           write $PAM_SERVICE (lock screen only; asks for sudo)
+  enable          wire the key into sudo, polkit and the lock screen
+  disable         unwire PAM everywhere, keeping enrollments
+  repair          fix an installation the stock Omarchy flow already made
+
+Health
+  status          enrolled keys, PAM wiring, attached authenticators
+  doctor          check every link in the chain and explain what is missing
+  state           the same, as JSON (consumed by the panel and bar widget)
+  detect          exit 0 if any authenticator is attached
+  rebase          three-way merge this fork onto a newer built-in lock plugin
+
+Run 'doctor' first when the lock screen is not offering your key.
+USAGE
+}
+
+command=""
+declare -a args=()
+while (( $# > 0 )); do
+  case "$1" in
+  enroll | list | remove | setup | enable | disable | repair | status | doctor | state | detect | rebase) command="$1"; shift ;;
+  --yes | -y) ASSUME_YES=1; shift ;;
+  --force) FORCE=1; shift ;;
+  -h | --help) usage; exit 0 ;;
+  *)
+    [[ -n $command ]] || fail "unknown argument: $1"
+    args+=("$1"); shift ;;
+  esac
+done
+
+case "$command" in
+enroll) cmd_enroll "${args[@]:-}" ;;
+list) cmd_list "${args[@]:-}" ;;
+remove) cmd_remove_credential "${args[@]:-}" ;;
+setup) cmd_setup ;;
+enable) cmd_enable ;;
+disable) cmd_disable ;;
+repair) cmd_repair ;;
+status) cmd_status ;;
+doctor) cmd_doctor ;;
+state) cmd_state ;;
+detect) cmd_detect ;;
+rebase) cmd_rebase ;;
+*) usage; exit 1 ;;
+esac
