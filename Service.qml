@@ -420,12 +420,12 @@ Item {
     runWake()
     fido2NeedsPin = false
     pendingFido2Pin = ""
-    fido2Status = "Waiting for your security key…"
+    fido2Status = "Waiting for your key…"
     fido2Authenticating = true
 
     if (!fido2Pam.start()) {
       fido2Authenticating = false
-      fido2Status = "Could not start security key check"
+      fido2Status = "Could not start the key"
     }
   }
 
@@ -578,8 +578,12 @@ Item {
       loadBackground: root.previewVisible
       passwordText: ""
       fido2Configured: root.fido2Configured
-      fido2Active: false
       fido2TokenPresent: root.fido2TokenPresent
+      // The preview is meant to show what the lock screen will look like, and
+      // for someone with a key enrolled and attached that is key mode. It is
+      // an illustration, not the state machine: nothing here settles authMode
+      // or starts a PAM conversation, so previewing never touches the key.
+      fido2Active: root.fido2Configured && root.fido2TokenPresent && root.defaultMode !== "password"
     }
 
     MouseArea {

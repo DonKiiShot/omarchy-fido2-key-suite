@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "erijl.lock",
-  "name": "Lock Screen with FIDO2 Security Key",
-  "version": "1.0.0",
+  "name": "FIDO2 Security Key Suite",
+  "version": "2.0.0",
   "author": "Erijl",
   "license": "MIT",
-  "description": "Unlock the Omarchy lock screen with a FIDO2/U2F security key (YubiKey, Token2, Nitrokey) via pam_u2f: touch to unlock, or PIN + touch on keys that require user verification. Uses its own PAM service, so a mistyped password is never spent against the key's PIN retries.",
+  "description": "One security key for the whole machine: unlock the Omarchy lock screen, sudo and polkit with a FIDO2/U2F security key (YubiKey, Token2, Nitrokey) via pam_u2f, enroll and manage credentials from a native panel and bar widget, mint hardware-backed SSH keys, and lock the screen the moment the key is pulled out.",
   "kinds": [
     "service",
     "panel",

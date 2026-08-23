@@ -30,11 +30,14 @@ Item {
   // where it would be spent against the key's eight-attempt retry budget.
   readonly property bool acceptsInput: fido2Active ? fido2NeedsPin : true
 
+  // The field elides at about 25 characters, so these stay short enough to be
+  // read whole: "Waiting for your security key…" arrived as "Waiting for your
+  // securit…" on a real lock screen.
   readonly property string placeholderText: {
     if (!fido2Active) return "Enter Password"
     if (!fido2TokenPresent) return "No security key detected"
     if (fido2Status.length > 0) return fido2Status
-    return "Waiting for your security key…"
+    return "Waiting for your key…"
   }
   readonly property int fieldWidth: 381
   readonly property int fieldHeight: 67

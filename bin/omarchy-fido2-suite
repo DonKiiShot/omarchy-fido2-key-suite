@@ -906,8 +906,9 @@ check_hardware() {
     [[ -n $retries ]] && traits+=("$retries PIN retries left")
 
     ok "$device -- ${traits[*]:-no notable options}"
-    [[ -n $retries && $retries -le 3 ]] &&
+    if [[ -n $retries && $retries -le 3 ]]; then
       warn "only $retries PIN retries left on $device; at 0 the key factory-resets"
+    fi
   done
 }
 
@@ -967,7 +968,29 @@ check_plugin() {
   if [[ $(jq -r '.enabled' <<<"$entry") == "true" ]]; then
     ok "the bar widget is on the bar"
   else
-    note "the bar widget is not on the bar -- add it with: omarchy plugin enable $PLUGIN_ID"
+    note "the bar widget is not on the bar -- add it with: omarchy bar put $PLUGIN_ID"
+  fi
+
+  # A partial checkout loads its service and then fails to summon anything,
+  # with the failure buried in the shell log.
+  local missing=() point
+  while IFS= read -r point; do
+    [[ -f "$PLUGIN_DIR/$point" ]] || missing+=("$point")
+  done < <(jq -r '.entryPoints[]' "$PLUGIN_DIR/manifest.json" 2>/dev/null)
+
+  if (( ${#missing[@]} )); then
+    bad "missing entry point(s): ${missing[*]}"
+    note "the checkout is incomplete -- omarchy plugin update $PLUGIN_ID"
+  else
+    ok "every surface this plugin declares is present (lock screen, panel, bar widget)"
+  fi
+
+  local watchers
+  watchers=$(jq -r '.presenceWatchers // 0' <<<"$status")
+  if [[ $(jq -r '.lockOnUnplug' <<<"$status") == "true" ]]; then
+    ok "the session locks when the key is removed"
+  elif [[ $(jq -r '.notifyOnKeyChange' <<<"$status") == "true" || $watchers != "0" ]]; then
+    note "watching for the key while unlocked; lockOnUnplug is off"
   fi
 
   printf '    %s%s%s\n' "$DIM" \
@@ -1016,13 +1039,50 @@ check_upstream() {
   fi
 }
 
+check_ssh() {
+  heading "SSH"
+
+  local -a keys=()
+  local key
+  # An sk key is recognisable from its public half alone, which is the only
+  # half worth reading here.
+  for key in "$HOME"/.ssh/*.pub; do
+    [[ -f $key ]] || continue
+    grep -q "^sk-" "$key" && keys+=("$key")
+  done
+
+  if (( ${#keys[@]} == 0 )); then
+    note "no hardware-backed SSH key yet -- mint one with: $0 ssh"
+    return
+  fi
+
+  for key in "${keys[@]}"; do
+    ok "${key%.pub} is held on a security key"
+  done
+
+  local signing
+  signing=$(git config --global user.signingkey 2>/dev/null || true)
+  if [[ -n $signing && $(git config --global commit.gpgsign 2>/dev/null) == "true" ]]; then
+    ok "commits are signed with $signing"
+  else
+    note "not signing commits with it yet -- $0 ssh prints the three git config lines"
+  fi
+}
+
 cmd_doctor() {
-  check_plugin
-  check_pam
-  check_credentials
-  check_hardware
-  check_pin_policy
-  check_upstream
+  # Every check reports through ok/warn/bad and counts its own failures, so the
+  # exit status of whatever it happened to run last carries no meaning -- but
+  # under `set -e` it ends the report where it stands. That is exactly what a
+  # trailing `[[ retries -le 3 ]] && warn ...` did on any key with more than
+  # three PIN attempts left: the Authenticators section was the last thing
+  # anyone ever saw, and the sections after it looked like they did not exist.
+  check_plugin || true
+  check_pam || true
+  check_credentials || true
+  check_hardware || true
+  check_pin_policy || true
+  check_ssh || true
+  check_upstream || true
 
   echo
   if (( FAILURES )); then

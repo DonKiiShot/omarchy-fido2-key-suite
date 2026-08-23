@@ -476,5 +476,22 @@ grep -q "no FIDO2 authenticator detected" "$output" ||
   fail "ssh refuses without an authenticator" "$(cat "$output")"
 pass "ssh refuses without an authenticator attached"
 
+# --- doctor reports every section it has ------------------------------------
+
+# A check whose last line was a plain `[[ ... ]] && warn ...` returned non-zero
+# whenever the warning did not apply, and `set -e` ended the report there. On
+# any key with more than three PIN attempts left, everything after the
+# Authenticators section silently did not exist.
+reset_state
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run "" doctor || true
+
+grep -q "Authenticators" "$output" ||
+  fail "doctor reaches the authenticator section" "$(cat "$output")"
+grep -q "Upstream" "$output" ||
+  fail "doctor reaches its last section" "$(cat "$output")"
+pass "doctor reports every section, not just the ones before the first passing check"
+
 echo
 echo "all management assertions passed"

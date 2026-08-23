@@ -64,6 +64,9 @@ else
   skip "omarchy plugin validate" "not an Omarchy machine"
 fi
 
+# The marketplace picks this up from the repo root for the listing.
+check "preview.png is present" test -f "$REPO/preview.png"
+
 check "no symlinks anywhere in the folder" bash -c '
   link=$(find "$1" -name .git -prune -o -type l -print -quit)
   [[ -z $link ]] || { echo "symlink: $link"; exit 1; }' _ "$REPO"
