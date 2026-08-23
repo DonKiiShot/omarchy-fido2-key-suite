@@ -1,5 +1,5 @@
 # The revision of Omarchy's built-in lock plugin this fork was taken from.
-# Used by `bin/omarchy-lock-fido2 doctor` to notice when upstream has moved,
+# Used by `bin/omarchy-fido2-suite doctor` to notice when upstream has moved,
 # and by `... rebase` as the merge base for a three-way merge.
 #
 # Update both this file and the copies beside it in the same commit that

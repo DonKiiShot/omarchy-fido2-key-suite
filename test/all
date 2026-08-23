@@ -155,7 +155,7 @@ else
       flunk "upstream/$file matches its hash in BASE" "recorded $recorded, file $snapshot"
     elif [[ $recorded != "$installed" ]]; then
       flunk "upstream/$file matches the installed lock plugin" \
-        "upstream has moved -- run: bin/omarchy-lock-fido2 rebase"
+        "upstream has moved -- run: bin/omarchy-fido2-suite rebase"
     else
       pass "upstream/$file is current"
     fi

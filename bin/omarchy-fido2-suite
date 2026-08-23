@@ -941,7 +941,7 @@ check_plugin() {
 
   if [[ -z $entry ]]; then
     bad "$PLUGIN_ID is not installed"
-    note "omarchy plugin add https://github.com/Erijl/omarchy-fido2-lockscreen-plugin.git --enable"
+    note "omarchy plugin add https://github.com/Erijl/omarchy-fido2-key-suite.git --enable"
     return
   fi
   ok "$PLUGIN_ID is installed"
