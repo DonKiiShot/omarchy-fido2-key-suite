@@ -679,13 +679,36 @@ Item {
     onTriggered: root.refreshFido2Token()
   }
 
+  // ---- bounds on external commands ----------------------------------------
+  //
+  // Every command below either talks to a USB device or to a system service
+  // over DBus, and both can stop answering. The readings here drive a poll, so
+  // an unbounded call is not a slow refresh -- it is presence detection that
+  // silently stops working for the rest of the session. Each one therefore
+  // gets a deadline, and each collected stream a ceiling, so no StdioCollector
+  // can grow past a known size regardless of what the child emits.
+  readonly property int commandDeadlineSeconds: 5
+  readonly property int commandOutputLimit: 4096
+
+  // `bash -c '<script>' <name> <args...>` -- $0 is the name, so the deadline
+  // and the ceiling arrive as $1 and $2 rather than being spliced into the
+  // script text.
+  function boundedCommand(script) {
+    return ["bash", "-c",
+            "timeout -k 2 \"$1\" bash -c \"$3\" bounded \"${@:4}\" 2>/dev/null | head -c \"$2\"",
+            "omarchy-fido2-bounded",
+            String(root.commandDeadlineSeconds),
+            String(root.commandOutputLimit),
+            script]
+  }
+
   Process {
     id: notifyProcess
   }
 
   Process {
     id: readlinkProc
-    command: ["readlink", "-f", root.currentBackgroundLink]
+    command: root.boundedCommand("readlink -f \"$1\"").concat([root.currentBackgroundLink])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -700,7 +723,8 @@ Item {
 
   Process {
     id: fingerprintCheckProc
-    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]] && command -v fprintd-list >/dev/null 2>&1 && fprintd-list \"$USER\" 2>/dev/null | grep -qi finger; then echo yes; else echo no; fi"]
+    // fprintd-list is a DBus round trip to a service that can be wedged.
+    command: root.boundedCommand("if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]] && command -v fprintd-list >/dev/null 2>&1 && fprintd-list \"$USER\" 2>/dev/null | grep -qi finger; then echo yes; else echo no; fi")
     stdout: StdioCollector { id: fingerprintCheckStdout; waitForEnd: true }
     onExited: {
       root.fingerprintConfigured = String(fingerprintCheckStdout.text || "").trim() === "yes"
@@ -720,11 +744,11 @@ Item {
   // from `omarchy-shell lock status` alone.
   Process {
     id: fido2CheckProc
-    command: ["bash", "-c",
+    command: root.boundedCommand(
       "pam=no; enrolled=no; "
       + "[[ -f /etc/pam.d/omarchy-lock-fido2 ]] && pam=yes; "
       + "grep -q \"^$USER:\" /etc/fido2/fido2 2>/dev/null && enrolled=yes; "
-      + "echo \"$pam $enrolled\""]
+      + "echo \"$pam $enrolled\"")
     stdout: StdioCollector { id: fido2CheckStdout; waitForEnd: true }
     onExited: {
       var answer = String(fido2CheckStdout.text || "").trim().split(/\s+/)
@@ -737,7 +761,9 @@ Item {
 
   Process {
     id: fido2DetectProc
-    command: ["bash", "-c", "fido2-token -L 2>/dev/null | grep -q . && echo yes || echo no"]
+    // The hot one: this runs every two seconds while the key matters, and it
+    // is the call a wedged authenticator blocks.
+    command: root.boundedCommand("fido2-token -L 2>/dev/null | grep -q . && echo yes || echo no")
     stdout: StdioCollector { id: fido2DetectStdout; waitForEnd: true }
     onExited: {
       var present = String(fido2DetectStdout.text || "").trim() === "yes"
@@ -776,7 +802,7 @@ Item {
 
   Process {
     id: strandedLockCheckProc
-    command: ["bash", "-c", "omarchy-hyprland-session-locked"]
+    command: ["timeout", "-k", "2", "10", "bash", "-c", "omarchy-hyprland-session-locked"]
     onExited: function(exitCode) {
       // No output to read the lock off yet.
       if (exitCode === 2) return
@@ -791,12 +817,12 @@ Item {
 
   Process {
     id: wakeProcess
-    command: ["bash", "-c", "omarchy-system-wake"]
+    command: ["timeout", "-k", "2", "10", "bash", "-c", "omarchy-system-wake"]
   }
 
   Process {
     id: blankProcess
-    command: ["bash", "-c", "omarchy-brightness-keyboard off; omarchy-brightness-display off"]
+    command: ["timeout", "-k", "2", "10", "bash", "-c", "omarchy-brightness-keyboard off; omarchy-brightness-display off"]
   }
 
   Timer {

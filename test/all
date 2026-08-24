@@ -147,6 +147,56 @@ check "every panel action goes through the terminal wrapper" bash -c '
   ! grep -n "execDetached" "$1/ManagementPanel.qml" \
     | grep -qv "omarchy-launch-floating-terminal-with-presentation"' _ "$REPO"
 
+printf '\n\e[1mUntrusted input\e[0m\n'
+
+# A credential label is typed by whoever enrolled the key; a token name is
+# whatever string the USB device chose to report. Both are rendered, and QML's
+# default textFormat is AutoText -- it sniffs for markup and will happily parse
+# a label as rich text and fetch whatever an <img src> in it points at.
+check "every Text pins textFormat to PlainText" bash -c '
+  cd "$1" || exit 1
+  opens=$(grep -c "^\s*Text {\s*$" ./*.qml | awk -F: "{n += \$2} END {print n + 0}")
+  plain=$(grep -c "textFormat: Text.PlainText" ./*.qml | awk -F: "{n += \$2} END {print n + 0}")
+  [[ $opens -gt 0 && $opens -eq $plain ]] || { echo "$opens Text blocks, $plain pinned to PlainText"; exit 1; }' _ "$REPO"
+
+# Every collected stream is a buffer that grows to whatever the child writes,
+# and every command that touches a key or a DBus service can stop answering.
+check "every collected command carries a deadline and a ceiling" bash -c '
+  cd "$1" || exit 1
+  for file in Service.qml ManagementPanel.qml; do
+    collectors=$(grep -c "StdioCollector" "$file")
+    (( collectors == 0 )) && continue
+    grep -q "timeout -k" "$file" || { echo "$file collects output with no deadline"; exit 1; }
+    grep -q "head -c" "$file" || { echo "$file collects output with no ceiling"; exit 1; }
+  done' _ "$REPO"
+
+check "the panel caps how many rows it will build" bash -c '
+  grep -q "slice(0, maxRows)" "$1/ManagementPanel.qml"' _ "$REPO"
+
+# The producer is the real bound: the panel polls, so an unbounded enumeration
+# is an unbounded call repeated forever.
+check "state caps its enumerations and reports the true totals" bash -c '
+  set -euo pipefail
+  out=$(OMARCHY_FIDO2_MAX_CREDENTIALS=1 "$1/bin/omarchy-fido2-suite" state)
+  jq -e ".credentials | length <= 1" <<<"$out" >/dev/null
+  jq -e "has(\"counts\") and has(\"limits\") and has(\"truncated\")" <<<"$out" >/dev/null
+  jq -e ".counts.credentials >= (.credentials | length)" <<<"$out" >/dev/null' _ "$REPO"
+
+check "a label carrying escapes and markup is stripped and clipped" bash -c '
+  set -euo pipefail
+  # Source the helpers without running a command.
+  eval "$(sed -n "/^MAX_FIELD_CHARS=/p;/^sanitize_field()/,/^}/p" "$1/bin/omarchy-fido2-suite")"
+  MAX_FIELD_CHARS=16
+  got=$(sanitize_field "$(printf "a\033[31mb\nc\td")<img src=x>eeeeeeeeeeeeeeeeeeee")
+  [[ $got != *$"\033"* ]] || { echo "escape survived: $got"; exit 1; }
+  [[ $got != *$"\n"* ]]   || { echo "newline survived"; exit 1; }
+  (( ${#got} <= 16 ))      || { echo "not clipped: ${#got} chars"; exit 1; }' _ "$REPO"
+
+check "removal still sees every credential, cap or no cap" bash -c '
+  # credentials() must stay uncapped: cmd_remove_credential rewrites the
+  # mapping file from it, and a truncated list would delete the remainder.
+  ! sed -n "/^credentials()/,/^}/p" "$1/bin/omarchy-fido2-suite" | grep -q "head -n"' _ "$REPO"
+
 printf '\n\e[1mUpstream\e[0m\n'
 
 if [[ ! -d $OMARCHY_LOCK_DIR ]]; then

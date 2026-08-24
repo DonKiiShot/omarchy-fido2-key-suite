@@ -78,8 +78,42 @@ Item {
   }
   readonly property string suiteBin: suiteDir + "/bin/omarchy-fido2-suite"
 
-  readonly property var credentials: suiteState && suiteState.credentials ? suiteState.credentials : []
-  readonly property var tokens: suiteState && suiteState.tokens ? suiteState.tokens : []
+  // ---- bounds on untrusted input ------------------------------------------
+  //
+  // `state` already caps what it emits, but the panel does not take that on
+  // trust: a plugin directory is a checkout the user can edit, and a stale or
+  // swapped script must not be able to hand the shell a million delegates to
+  // instantiate. These are the numbers the UI will actually build.
+  readonly property int maxRows: 64
+  readonly property int maxLabelChars: 64
+  readonly property int maxErrorChars: 512
+
+  // Every string that came from a device, the mapping file or a command's
+  // stderr passes through here before it is bound to anything. Control
+  // characters are dropped -- they have no business in a label, and U+2028 and
+  // friends break layout -- and the result is clipped. Rich text is refused
+  // separately, by textFormat on each Text.
+  function safeText(value, limit) {
+    var out = String(value === undefined || value === null ? "" : value)
+      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    return out.length > limit ? out.slice(0, limit) + "…" : out
+  }
+
+  readonly property var credentials: suiteState && suiteState.credentials
+    ? suiteState.credentials.slice(0, maxRows) : []
+  readonly property var tokens: suiteState && suiteState.tokens
+    ? suiteState.tokens.slice(0, maxRows) : []
+
+  // What the producer says it found, so a clipped list can say so out loud
+  // rather than passing itself off as the whole picture.
+  readonly property int credentialsTotal: suiteState && suiteState.counts
+    && typeof suiteState.counts.credentials === "number"
+    ? suiteState.counts.credentials : credentials.length
+  readonly property int tokensTotal: suiteState && suiteState.counts
+    && typeof suiteState.counts.tokens === "number"
+    ? suiteState.counts.tokens : tokens.length
+  readonly property bool rowsTruncated: credentialsTotal > credentials.length
+    || tokensTotal > tokens.length
   readonly property var wiring: suiteState && suiteState.wiring ? suiteState.wiring : null
   readonly property bool lockWired: !!(wiring && wiring.lockScreen)
   readonly property bool sudoWired: !!(wiring && wiring.sudo)
@@ -288,14 +322,41 @@ Item {
 
   // ---- state process ------------------------------------------------------
 
+  // `state` interrogates whatever is plugged into the USB port, so it is the
+  // one thing here that a device can hold open: libfido2 blocks on a key that
+  // has wedged its HID endpoint. Three bounds, because the panel polls and a
+  // stuck refresh must not become a pile of stuck refreshes:
+  //
+  //   timeout(1)  a hard deadline, SIGTERM then SIGKILL two seconds later
+  //   head -c     a ceiling on each stream, so neither StdioCollector can
+  //               grow without limit no matter what the child decides to say
+  //   PIPESTATUS  so the pipeline still reports the producer's exit code
+  //               rather than head's
+  readonly property int stateDeadlineSeconds: 15
+  readonly property int stateStdoutLimit: 262144
+  readonly property int stateStderrLimit: 4096
+
   Process {
     id: stateProc
-    command: [root.suiteBin, "state"]
+    command: ["bash", "-c",
+              "timeout -k 2 \"$2\" \"$1\" state 2> >(head -c \"$4\" >&2) | head -c \"$3\"; exit \"${PIPESTATUS[0]}\"",
+              "omarchy-fido2-suite-state",
+              root.suiteBin,
+              String(root.stateDeadlineSeconds),
+              String(root.stateStdoutLimit),
+              String(root.stateStderrLimit)]
     stdout: StdioCollector { id: stateOut; waitForEnd: true }
     stderr: StdioCollector { id: stateErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running) stateWatchdog.restart()
+      else stateWatchdog.stop()
+    }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        root.stateError = String(stateErr.text || "").trim() || ("omarchy-fido2-suite state exited " + exitCode)
+        root.stateError = exitCode === 124 || exitCode === 137
+          ? "`omarchy-fido2-suite state` timed out -- a security key may not be answering"
+          : (root.safeText(stateErr.text, root.maxErrorChars).trim()
+             || ("omarchy-fido2-suite state exited " + exitCode))
         root.stateLoaded = true
         return
       }
@@ -303,10 +364,27 @@ Item {
         root.suiteState = JSON.parse(String(stateOut.text || ""))
         root.stateError = ""
       } catch (e) {
+        // Also the path a clipped stdout takes: truncated JSON does not parse,
+        // so an over-long answer fails closed instead of half-rendering.
         root.stateError = "could not parse the output of `omarchy-fido2-suite state`"
       }
       root.stateLoaded = true
       root.clampCursor()
+    }
+  }
+
+  // Belt to timeout(1)'s braces: if the child is never reaped at all -- a
+  // process stuck in uninterruptible IO on the USB stack does that -- the
+  // panel still stops waiting, and the next poll is free to try again.
+  Timer {
+    id: stateWatchdog
+    interval: (root.stateDeadlineSeconds + 5) * 1000
+    repeat: false
+    onTriggered: {
+      if (!stateProc.running) return
+      stateProc.running = false
+      root.stateError = "`omarchy-fido2-suite state` did not return; giving up on this refresh"
+      root.stateLoaded = true
     }
   }
 
@@ -427,6 +505,7 @@ Item {
                 spacing: Style.space(8)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "\ueb11"
                   color: root.tokens.length > 0 ? root.accent : root.dim
                   font.family: root.fontFamily
@@ -435,6 +514,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "FIDO2 security key suite"
                   color: root.foreground
                   font.family: root.fontFamily
@@ -453,7 +533,8 @@ Item {
               tone: root.urgent
               foreground: root.foreground
               fontFamily: root.fontFamily
-              text: root.stateError === "" ? "" : ("Could not read the suite state: " + root.stateError)
+              text: root.stateError === "" ? ""
+                : ("Could not read the suite state: " + root.safeText(root.stateError, root.maxErrorChars))
             }
 
             // ---- attached authenticators ----------------------------------
@@ -469,6 +550,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 visible: root.tokens.length === 0
                 wrapMode: Text.WordWrap
@@ -502,13 +584,16 @@ Item {
                       spacing: Style.space(8)
 
                       Text {
-                        text: String(tokenRow.modelData.name || "Security key")
+                        textFormat: Text.PlainText
+                        text: root.safeText(tokenRow.modelData.name || "Security key", root.maxLabelChars)
+                        elide: Text.ElideRight
                         color: root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         text: typeof tokenRow.modelData.pinRetries === "number"
                           ? "· " + tokenRow.modelData.pinRetries + " PIN attempts left"
                           : ""
@@ -521,10 +606,11 @@ Item {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       wrapMode: Text.WordWrap
                       text: {
-                        var parts = [String(tokenRow.modelData.device || "")]
+                        var parts = [root.safeText(tokenRow.modelData.device, root.maxLabelChars)]
                         if (String(tokenRow.modelData.alwaysUv) === "true") parts.push("alwaysUv")
                         if (String(tokenRow.modelData.clientPin) === "true") parts.push("PIN set")
                         else parts.push("no PIN set")
@@ -554,6 +640,18 @@ Item {
               }
             }
 
+            // Bounded lists are only honest if they admit it.
+            Notice {
+              width: parent.width
+              visible: root.rowsTruncated
+              tone: root.urgent
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              text: "Showing " + root.credentials.length + " of " + root.credentialsTotal
+                + " credentials and " + root.tokens.length + " of " + root.tokensTotal
+                + " authenticators. The rest are not displayed."
+            }
+
             // ---- enrolled credentials -------------------------------------
             Column {
               id: credentialsColumn
@@ -568,6 +666,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 visible: root.stateLoaded && root.credentials.length === 0
                 wrapMode: Text.WordWrap
@@ -609,7 +708,9 @@ Item {
                     spacing: Style.space(2)
 
                     Text {
-                      text: credRow.modelData.index + ".  " + String(credRow.modelData.label || "unlabelled")
+                      textFormat: Text.PlainText
+                      text: root.safeText(credRow.modelData.index, 8) + ".  "
+                        + root.safeText(credRow.modelData.label || "unlabelled", root.maxLabelChars)
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
@@ -618,11 +719,12 @@ Item {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       elide: Text.ElideRight
                       text: {
-                        var parts = [String(credRow.modelData.flags || "")]
-                        var date = String(credRow.modelData.enrolled || "")
+                        var parts = [root.safeText(credRow.modelData.flags, root.maxLabelChars)]
+                        var date = root.safeText(credRow.modelData.enrolled, root.maxLabelChars)
                         if (date !== "") parts.push("enrolled " + date)
                         return parts.join("  ·  ")
                       }
@@ -788,6 +890,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: "j/k move  ·  Enter act  ·  x remove  ·  r refresh  ·  Esc close"

@@ -247,6 +247,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         anchors.fill: passwordInput
         text: root.authenticatingPassword ? "Checking…" : (root.failureMessage.length > 0 ? root.failureMessage : root.placeholderText)
         visible: passwordInput.text.length === 0
@@ -263,6 +264,7 @@ Item {
       // enrolled, so the user knows they can touch to unlock instead of typing.
       // Matches hyprlock, which draws its fingerprint icon in the same spot.
       Text {
+        textFormat: Text.PlainText
         id: fingerprintIcon
         objectName: "fingerprintIndicator"
         anchors.right: parent.right
@@ -282,6 +284,7 @@ Item {
       // Fido2. Lit while the key is the active factor, dimmed when it is merely
       // available, and half-dimmed when the mode is on but no key is plugged in.
       Text {
+        textFormat: Text.PlainText
         id: fido2Icon
         objectName: "fido2Indicator"
         anchors.right: fingerprintIcon.visible ? fingerprintIcon.left : parent.right
@@ -346,6 +349,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: authModeLabel
         anchors.centerIn: parent
         text: root.fido2Active ? "Use password instead" : "Use security key instead"

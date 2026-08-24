@@ -20,6 +20,7 @@ BorderSurface {
   borderSpec: Border.flat(Qt.rgba(tone.r, tone.g, tone.b, 0.35), 1)
 
   Text {
+    textFormat: Text.PlainText
     id: body
     anchors.left: parent.left
     anchors.right: parent.right

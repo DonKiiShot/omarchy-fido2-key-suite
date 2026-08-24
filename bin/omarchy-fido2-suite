@@ -42,6 +42,22 @@ FORCE=0
 RESIDENT=0
 FAILURES=0
 
+# ------------------------------------------------------- bounds and deadlines
+#
+# Everything this script reads back out to the panel is attacker-influenced:
+# the mapping file can hold any number of credentials, a hostile or merely
+# broken USB device can claim any product name it likes, and every fido2-token
+# call talks to that device over HID -- a device that never answers hangs the
+# call, and the panel polls. So enumeration is capped, every string that
+# reaches the UI is stripped of control characters and truncated, and every
+# non-interactive call into an authenticator carries a deadline.
+#
+# Overridable for the test suite; not documented as a knob.
+MAX_CREDENTIALS=${OMARCHY_FIDO2_MAX_CREDENTIALS:-64}
+MAX_TOKENS=${OMARCHY_FIDO2_MAX_TOKENS:-8}
+MAX_FIELD_CHARS=${OMARCHY_FIDO2_MAX_FIELD_CHARS:-64}
+TOKEN_TIMEOUT=${OMARCHY_FIDO2_TOKEN_TIMEOUT:-5}
+
 # ------------------------------------------------------------------ output
 
 if [[ -t 1 ]]; then
@@ -101,15 +117,39 @@ require_tools() {
 
 # ---------------------------------------------------- authenticator queries
 
+# Every non-interactive call into a key goes through here. A key that has
+# wedged its HID endpoint -- or a device that only pretends to be one -- makes
+# libfido2 block, and the panel refreshes on a timer, so an unbounded call is
+# an unbounded pile of them. Deliberately not used for pamu2fcfg or
+# ssh-keygen: those legitimately wait for a human to touch the key.
+fido2_token() { timeout -k 1 "$TOKEN_TIMEOUT" fido2-token "$@"; }
+
+# One line of untrusted text, made fit to put in JSON and to render. Control
+# characters go first -- a device name carrying ANSI escapes rewrites this
+# script's own terminal output, and a newline would split a --porcelain
+# record -- then the result is truncated. LC_ALL=C so the bracket range is
+# byte-wise rather than at the mercy of the locale's collation order.
+sanitize_field() {
+  local LC_ALL=C s=$1
+  s=${s//[$'\001'-$'\037'$'\177']/}
+  printf '%s' "${s:0:$MAX_FIELD_CHARS}"
+}
+
 # Devices are listed as "/dev/hidrawN: vendor=... (Product Name)".
-token_nodes() { fido2-token -L 2>/dev/null | cut -d: -f1 | grep . || true; }
+# Capped here rather than at each caller: a USB device can claim as many
+# hidraw nodes as it likes, and every one of them costs a deadline's worth of
+# waiting in the loops below. No real machine has MAX_TOKENS keys attached.
+token_nodes() { fido2_token -L 2>/dev/null | cut -d: -f1 | grep . | head -n "$MAX_TOKENS" || true; }
+
+# The true count, for telling the user that the list they are looking at was cut.
+token_node_count() { fido2_token -L 2>/dev/null | cut -d: -f1 | grep -c . || true; }
 
 # The product name is the trailing parenthesized group, and may itself contain
 # parentheses -- "TOKEN2 FIDO2 Security Key(0024)" -- so split on the first
 # " (" and the final ")" rather than on every paren.
 token_name() {
   local line
-  line=$(fido2-token -L 2>/dev/null | grep -m1 "^$1:" || true)
+  line=$(fido2_token -L 2>/dev/null | grep -m1 "^$1:" || true)
   [[ $line == *" ("* ]] || return 0
   line=${line#* (}
   printf '%s\n' "${line%)}"
@@ -351,7 +391,7 @@ cmd_enroll() {
 
   local dev info flags
   dev=$(head -1 <<<"$nodes")
-  info=$(fido2-token -I "$dev") || fail "could not interrogate $dev"
+  info=$(fido2_token -I "$dev") || fail "could not interrogate $dev"
 
   if ! flags=$(registration_flags "$info"); then
     bad "this key enforces alwaysUv but has no PIN set, so nothing can satisfy it"
@@ -430,7 +470,7 @@ cmd_enroll() {
 }
 
 cmd_list() {
-  local porcelain=0 n=0 cred key
+  local porcelain=0 total=0 shown=0 cred key
   [[ ${1:-} == "--porcelain" ]] && porcelain=1
 
   if [[ $(credential_count) -eq 0 ]]; then
@@ -440,18 +480,29 @@ cmd_list() {
 
   (( porcelain )) || printf '%-3s %-22s %-18s %s\n' "#" "LABEL" "VERIFICATION" "ENROLLED"
   while IFS= read -r cred; do
-    n=$((n + 1))
+    total=$((total + 1))
+    (( shown < MAX_CREDENTIALS )) || continue
+    shown=$((shown + 1))
     key=$(cred_key "$cred")
+    # Labels are user-supplied and land in a terminal, so they are stripped of
+    # control characters here for the same reason the panel refuses to parse
+    # them as rich text: neither surface should let a label rewrite it.
     if (( porcelain )); then
       # Tab-separated; labels may contain spaces, so a column-aligned table is
       # not parseable.
       printf '%s\t%s\t%s\t%s\n' \
-        "$n" "$(label_for "$key")" "$(cred_flags "$cred")" "$(meta_field "$key" 4)"
+        "$total" "$(sanitize_field "$(label_for "$key")")" \
+        "$(sanitize_field "$(cred_flags "$cred")")" "$(sanitize_field "$(meta_field "$key" 4)")"
     else
       printf '%-3s %-22s %-18s %s\n' \
-        "$n" "$(label_for "$key")" "$(cred_flags "$cred")" "$(meta_field "$key" 4)"
+        "$total" "$(sanitize_field "$(label_for "$key")")" \
+        "$(sanitize_field "$(cred_flags "$cred")")" "$(sanitize_field "$(meta_field "$key" 4)")"
     fi
   done < <(credentials)
+
+  if (( total > shown )); then
+    (( porcelain )) || warn "showing $shown of $total credentials; remove some to see the rest"
+  fi
 }
 
 cmd_remove_credential() {
@@ -594,7 +645,7 @@ cmd_repair() {
   if (( stale )); then
     local dev info
     dev=$(head -1 <<<"$(token_nodes)")
-    if [[ -n $dev ]] && info=$(fido2-token -I "$dev" 2>/dev/null); then
+    if [[ -n $dev ]] && info=$(fido2_token -I "$dev" 2>/dev/null); then
       if [[ $(token_option alwaysUv "$info") == true ]]; then
         echo
         warn "a presence-only credential is enrolled, but the attached key enforces alwaysUv"
@@ -622,7 +673,7 @@ cmd_ssh() {
   [[ -n $nodes ]] || fail "no FIDO2 authenticator detected -- plug one in and try again"
 
   dev=$(head -1 <<<"$nodes")
-  info=$(fido2-token -I "$dev") || fail "could not interrogate $dev"
+  info=$(fido2_token -I "$dev") || fail "could not interrogate $dev"
 
   if [[ -z $name ]]; then
     name=$(ask_input "File name (default id_ed25519_sk)")
@@ -719,7 +770,7 @@ cmd_status() {
     note "none"
   else
     while IFS= read -r dev; do
-      info=$(fido2-token -I "$dev" 2>/dev/null) || continue
+      info=$(fido2_token -I "$dev" 2>/dev/null) || continue
       printf '  %s  %s\n' "$dev" "$(token_name "$dev")"
       printf '    %salwaysUv=%s  clientPin=%s  uv=%s  pin retries=%s%s\n' "$DIM" \
         "$(token_option alwaysUv "$info")" \
@@ -737,42 +788,66 @@ cmd_status() {
 cmd_state() {
   require_tools jq
 
-  local creds_json="[]" n=0 cred key
+  # Cardinality is bounded at this boundary rather than inside credentials(),
+  # because cmd_remove_credential rewrites the mapping file from that same
+  # list and must never be handed a truncated one -- capping there would
+  # delete every credential past the cap on the next removal.
+  local creds_json="[]" total=0 shown=0 cred key
   while IFS= read -r cred; do
-    n=$((n + 1))
+    total=$((total + 1))
+    (( shown < MAX_CREDENTIALS )) || continue
+    shown=$((shown + 1))
     key=$(cred_key "$cred")
-    creds_json=$(jq -c --argjson i "$n" --arg label "$(label_for "$key")" \
-      --arg flags "$(cred_flags "$cred")" --arg date "$(meta_field "$key" 4)" \
+    creds_json=$(jq -c --argjson i "$total" \
+      --arg label "$(sanitize_field "$(label_for "$key")")" \
+      --arg flags "$(sanitize_field "$(cred_flags "$cred")")" \
+      --arg date "$(sanitize_field "$(meta_field "$key" 4)")" \
       '. + [{index: $i, label: $label, flags: $flags, enrolled: $date}]' <<<"$creds_json")
   done < <(credentials)
 
-  local tokens_json="[]" dev info
+  # token_nodes() is already capped, so this loop is bounded by construction;
+  # each fido2_token call inside it carries its own deadline, which bounds the
+  # whole command at MAX_TOKENS * TOKEN_TIMEOUT in the worst case.
+  local tokens_json="[]" tokens_total=0 dev info
+  tokens_total=$(token_node_count)
   while IFS= read -r dev; do
     [[ -n $dev ]] || continue
-    info=$(fido2-token -I "$dev" 2>/dev/null) || continue
-    tokens_json=$(jq -c --arg dev "$dev" --arg name "$(token_name "$dev")" \
+    info=$(fido2_token -I "$dev" 2>/dev/null) || continue
+    tokens_json=$(jq -c --arg dev "$(sanitize_field "$dev")" \
+      --arg name "$(sanitize_field "$(token_name "$dev")")" \
       --arg alwaysUv "$(token_option alwaysUv "$info")" \
       --arg clientPin "$(token_option clientPin "$info")" \
       --arg uv "$(token_option uv "$info")" \
-      --arg retries "$(token_field "$info" 'pin retries')" \
+      --arg retries "$(sanitize_field "$(token_field "$info" 'pin retries')")" \
       '. + [{device: $dev, name: $name, alwaysUv: $alwaysUv, clientPin: $clientPin,
-             uv: $uv, pinRetries: ($retries | if . == "" then null else tonumber end)}]' \
+             uv: $uv,
+             pinRetries: ($retries | if test("^[0-9]+$") then tonumber else null end)}]' \
       <<<"$tokens_json")
   done < <(token_nodes)
 
   local authfile_owner=""
   [[ -f $AUTHFILE ]] && authfile_owner=$(stat -c '%U:%G' "$AUTHFILE")
 
+  # The counts travel with the lists so the panel can say "showing 64 of 900"
+  # instead of quietly rendering a short list as if it were the whole truth.
   jq -n \
     --arg user "$USER_NAME" \
     --argjson credentials "$creds_json" \
     --argjson tokens "$tokens_json" \
     --arg authfileOwner "$authfile_owner" \
+    --argjson credentialsTotal "$total" \
+    --argjson tokensTotal "${tokens_total:-0}" \
+    --argjson maxCredentials "$MAX_CREDENTIALS" \
+    --argjson maxTokens "$MAX_TOKENS" \
     --argjson lock "$(lock_wired && echo true || echo false)" \
     --argjson sudo "$(pam_wired sudo && echo true || echo false)" \
     --argjson polkit "$(pam_wired polkit-1 && echo true || echo false)" \
     '{user: $user, credentials: $credentials, tokens: $tokens,
       authfileOwner: $authfileOwner,
+      counts: {credentials: $credentialsTotal, tokens: $tokensTotal},
+      limits: {credentials: $maxCredentials, tokens: $maxTokens},
+      truncated: {credentials: ($credentialsTotal > $maxCredentials),
+                  tokens: ($tokensTotal > $maxTokens)},
       wiring: {lockScreen: $lock, sudo: $sudo, polkit: $polkit}}'
 }
 
@@ -890,7 +965,7 @@ check_hardware() {
   TOKEN_ALWAYS_UV=0
   local device info
   for device in "${devices[@]}"; do
-    info=$(fido2-token -I "$device" 2>/dev/null || true)
+    info=$(fido2_token -I "$device" 2>/dev/null || true)
     if [[ -z $info ]]; then
       warn "$device did not answer fido2-token -I"
       continue

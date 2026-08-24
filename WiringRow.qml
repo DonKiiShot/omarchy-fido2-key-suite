@@ -22,6 +22,7 @@ Item {
     spacing: Style.space(8)
 
     Text {
+      textFormat: Text.PlainText
       // U+F00C check / U+F00D times, written as escapes: these are Private
       // Use Area codepoints and do not survive every round trip as literals.
       text: root.wired ? "\uf00c" : "\uf00d"
@@ -34,6 +35,7 @@ Item {
     }
 
     Text {
+      textFormat: Text.PlainText
       text: root.label
       color: root.wired ? root.foreground : root.dim
       font.family: root.fontFamily
@@ -42,6 +44,7 @@ Item {
     }
 
     Text {
+      textFormat: Text.PlainText
       text: root.wired ? "" : "not wired"
       visible: !root.wired
       color: root.dim
