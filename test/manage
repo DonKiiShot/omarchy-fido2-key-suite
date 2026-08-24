@@ -640,6 +640,33 @@ grep -qF 'cue_prompt=[sudo\] touch your security key' "$sudo_pam" ||
   fail "the sudo cue prompt keeps its escaped bracket" "$(cat "$sudo_pam")"
 pass "the sudo cue prompt keeps its escaped bracket"
 
+# --- upgrading from a version with the escape bug repairs the rule -----------
+#
+# Up to 2.0.0 the sudo rule was written through `awk -v`, which ate PAM's "\]"
+# and left "[cue_prompt=[sudo] touch your security key]" on disk. That is not
+# what pam_line writes any more, so without recognising it every existing
+# install would report its own rule as somebody else's and ask to adopt it.
+
+reset_state
+enroll_one
+run "" enable || true
+# Put back exactly what the buggy version wrote: no marker (it did not exist
+# yet) and the escape eaten by awk -v.
+mangled=$(grep -v 'omarchy-fido2-suite:managed' "$sudo_pam")
+mangled=${mangled//\\]/]}
+printf '%s\n' "$mangled" >"$sudo_pam"
+run "" enable || true
+
+grep -q "did not write" "$output" &&
+  fail "the rule an older version wrote is recognised as ours" "$(cat "$output")"
+pass "the sudo rule an older version wrote is recognised as ours"
+
+grep -qF 'cue_prompt=[sudo\] touch your security key' "$sudo_pam" ||
+  fail "upgrading repairs the escape in place" "$(cat "$sudo_pam")"
+(( $(grep -c 'pam_u2f.so' "$sudo_pam") == 1 )) ||
+  fail "upgrading repairs the rule rather than adding a second" "$(cat "$sudo_pam")"
+pass "upgrading repairs the broken escape in place"
+
 # --- state tells the panel which rules are ours ------------------------------
 
 reset_state

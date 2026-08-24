@@ -376,15 +376,29 @@ pam_marker() {
 # FIDO2_MINE travels through the environment rather than `awk -v`, which runs
 # escape processing over the value and would mangle the "\]" that PAM's bracket
 # convention puts in the sudo cue_prompt.
+# What versions up to 2.0.0 actually wrote for sudo: the same line with PAM's
+# "\]" escape eaten by `awk -v`. Recognised as ours as well, so upgrading
+# repairs that rule in place instead of reporting it as somebody else's -- the
+# escape bug means every install made before this fix has one. Byte-exact
+# against a string we generate, so it cannot match a rule we did not write.
+# For polkit, which has no bracket in its cue, this is the same string as
+# pam_line and the extra comparison simply never fires.
+pam_line_legacy() {
+  local line
+  line=$(pam_line "$1")
+  printf '%s' "${line//\\]/]}"
+}
+
 pam_foreign_lines() { # file service -> the pam_u2f lines we do not own
   local file=$1 service=$2
   [[ -f $file ]] || return 0
-  FIDO2_MINE="$(pam_line "$service")" awk -v marker="$PAM_MARKER_TOKEN" '
-    BEGIN { mine = ENVIRON["FIDO2_MINE"] }
+  FIDO2_MINE="$(pam_line "$service")" FIDO2_WAS="$(pam_line_legacy "$service")" \
+    awk -v marker="$PAM_MARKER_TOKEN" '
+    BEGIN { mine = ENVIRON["FIDO2_MINE"]; was = ENVIRON["FIDO2_WAS"] }
     index($0, marker) { pending = 1; next }
     /pam_u2f\.so/ {
       if (pending) { pending = 0; next }
-      if ($0 == mine) next
+      if ($0 == mine || $0 == was) next
       print; next
     }
     { pending = 0 }
@@ -393,12 +407,13 @@ pam_foreign_lines() { # file service -> the pam_u2f lines we do not own
 
 pam_without_ours() { # file service -> the file, minus our marker and our rules
   local file=$1 service=$2
-  FIDO2_MINE="$(pam_line "$service")" awk -v marker="$PAM_MARKER_TOKEN" '
-    BEGIN { mine = ENVIRON["FIDO2_MINE"] }
+  FIDO2_MINE="$(pam_line "$service")" FIDO2_WAS="$(pam_line_legacy "$service")" \
+    awk -v marker="$PAM_MARKER_TOKEN" '
+    BEGIN { mine = ENVIRON["FIDO2_MINE"]; was = ENVIRON["FIDO2_WAS"] }
     index($0, marker) { pending = 1; next }
     /pam_u2f\.so/ {
       if (pending) { pending = 0; next }
-      if ($0 == mine) next
+      if ($0 == mine || $0 == was) next
       print; next
     }
     { pending = 0; print }
@@ -560,12 +575,13 @@ EOF
 # said yes.
 pam_foreign_removed() { # file service -> the file, minus the foreign pam_u2f rules
   local file=$1 service=$2
-  FIDO2_MINE="$(pam_line "$service")" awk -v marker="$PAM_MARKER_TOKEN" '
-    BEGIN { mine = ENVIRON["FIDO2_MINE"] }
+  FIDO2_MINE="$(pam_line "$service")" FIDO2_WAS="$(pam_line_legacy "$service")" \
+    awk -v marker="$PAM_MARKER_TOKEN" '
+    BEGIN { mine = ENVIRON["FIDO2_MINE"]; was = ENVIRON["FIDO2_WAS"] }
     index($0, marker) { pending = 1; print; next }
     /pam_u2f\.so/ {
       if (pending) { pending = 0; print; next }
-      if ($0 == mine) { print; next }
+      if ($0 == mine || $0 == was) { print; next }
       next
     }
     { pending = 0; print }
