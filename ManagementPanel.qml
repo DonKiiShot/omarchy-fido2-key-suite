@@ -119,6 +119,14 @@ Item {
   readonly property bool sudoWired: !!(wiring && wiring.sudo)
   readonly property bool polkitWired: !!(wiring && wiring.polkit)
   readonly property bool fullyWired: lockWired && sudoWired && polkitWired
+
+  // A pam_u2f rule in /etc/pam.d/sudo that this suite did not write. `wired`
+  // above means wired by us, so without this the row would read "not wired"
+  // for a service the key already unlocks -- and "Wire PAM" would then leave
+  // it alone, looking like it did nothing. Reported as its own state instead.
+  readonly property var foreignPam: suiteState && suiteState.foreignPam ? suiteState.foreignPam : null
+  readonly property bool sudoForeign: !!(foreignPam && foreignPam.sudo)
+  readonly property bool polkitForeign: !!(foreignPam && foreignPam.polkit)
   // Presence settings live on the service, which reads them from this
   // plugin's inline entry in shell.json. Reading them there rather than
   // re-parsing the file keeps one owner for the answer.
@@ -796,6 +804,7 @@ Item {
                 width: parent.width
                 label: "sudo"
                 wired: root.sudoWired
+                foreign: root.sudoForeign
                 foreground: root.foreground
                 dim: root.dim
                 accent: root.accent
@@ -806,6 +815,7 @@ Item {
                 width: parent.width
                 label: "polkit"
                 wired: root.polkitWired
+                foreign: root.polkitForeign
                 foreground: root.foreground
                 dim: root.dim
                 accent: root.accent

@@ -476,6 +476,183 @@ grep -q "no FIDO2 authenticator detected" "$output" ||
   fail "ssh refuses without an authenticator" "$(cat "$output")"
 pass "ssh refuses without an authenticator attached"
 
+# --- /etc/pam.d/sudo belongs to the system, not to this suite ----------------
+#
+# Wiring used to be `sed -i '/pam_u2f\.so/d'` followed by inserting our own
+# rule, which erases whatever else put a pam_u2f rule there -- Omarchy's own
+# Setup > Security > Fido2, pam-u2f's documented example, a hand-written line.
+# Rewriting it is worse than erasing it: a `required` rule (key *and*
+# password) came back as our `sufficient` one (key *or* password), turning a
+# second factor into a single touch that grants root. Ownership is recorded
+# with a marker comment now, and only marked rules are ever touched.
+
+FOREIGN_RULE='auth       required    pam_u2f.so authfile=/etc/other/keys cue'
+
+seed_foreign_rule() { # file
+  printf '#%%PAM-1.0\n%s\nauth      include   system-auth\n' "$FOREIGN_RULE" >"$1"
+}
+
+enroll_one() { # so `enable` has a credential to work with
+  attach_keys "Daily Key"
+  describe_key "rk, up, alwaysUv, clientPin"
+  run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll no -- "Daily"
+}
+
+reset_state
+enroll_one
+seed_foreign_rule "$sudo_pam"
+run "" enable || true
+
+grep -qF "$FOREIGN_RULE" "$sudo_pam" ||
+  fail "enable never deletes a pam_u2f rule it did not write" "$(cat "$sudo_pam")"
+pass "enable never deletes a pam_u2f rule it did not write"
+
+grep -q 'cue_prompt' "$sudo_pam" &&
+  fail "enable does not add its own rule beside a foreign one" "$(cat "$sudo_pam")"
+pass "enable leaves the whole service alone rather than stacking onto it"
+
+grep -q "did not write" "$output" ||
+  fail "enable says which service it left alone" "$(cat "$output")"
+grep -q -- "--adopt" "$output" ||
+  fail "enable says how to take the rule over" "$(cat "$output")"
+pass "enable explains what it left alone and how to adopt it"
+
+# polkit-1 has no foreign rule, so it should still be wired: one awkward
+# service must not block the rest.
+grep -q 'pam_u2f.so' "$polkit_pam" ||
+  fail "a foreign rule in one service does not block the others" "$(cat "$polkit_pam")"
+pass "a foreign rule in one service does not block the others"
+
+# --- disable removes ours and only ours --------------------------------------
+
+reset_state
+enroll_one
+seed_foreign_rule "$sudo_pam"
+run "" enable || true
+run "" disable || true
+
+grep -qF "$FOREIGN_RULE" "$sudo_pam" ||
+  fail "disable leaves a foreign rule where it found it" "$(cat "$sudo_pam")"
+pass "disable leaves a foreign rule where it found it"
+
+grep -q "still has a pam_u2f rule" "$output" ||
+  fail "disable says the foreign rule is still there" "$(cat "$output")"
+pass "disable says the foreign rule is still there"
+
+grep -q 'pam_u2f.so' "$polkit_pam" &&
+  fail "disable removes the rule it wrote itself" "$(cat "$polkit_pam")"
+pass "disable removes the rule it wrote itself"
+
+# --- an install from before the marker existed is still ours -----------------
+#
+# Without this, upgrading would strand a `sufficient pam_u2f` rule that
+# `disable` could no longer remove: a key touch would keep granting sudo after
+# the user had switched the suite off. A line byte-identical to what we would
+# write is ours by construction.
+
+reset_state
+enroll_one
+run "" disable || true
+legacy=$(PATH="$stub_bin:$PATH" USER=tester bash -c '
+  eval "$(sed -n "/^AUTHFILE=/p;/^pam_line()/,/^}/p" "$1")"; pam_line sudo' _ "$suite")
+printf '#%%PAM-1.0\n%s\nauth      include   system-auth\n' "$legacy" >"$sudo_pam"
+run "" disable || true
+
+grep -q 'pam_u2f.so' "$sudo_pam" &&
+  fail "an unmarked rule this suite would have written is still removable" "$(cat "$sudo_pam")"
+pass "an unmarked rule from an older version is still removable"
+
+# --- enroll asks before touching a service it does not own -------------------
+#
+# `pam_wired` used to mean "any pam_u2f rule exists", so somebody else's rule
+# counted as consent this suite had never been given: enroll took the
+# already-wired branch and rewrote it without ever showing the prompt.
+
+reset_state
+seed_foreign_rule "$sudo_pam"
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll no -- "Daily"
+
+grep -q '^gum confirm' "$calls" ||
+  fail "enroll still asks when the rule is somebody else's" "$(cat "$calls")"
+pass "enroll still asks for consent when the existing rule is not ours"
+
+grep -qF "$FOREIGN_RULE" "$sudo_pam" ||
+  fail "declining leaves the foreign rule alone" "$(cat "$sudo_pam")"
+pass "declining at the enroll prompt leaves the foreign rule alone"
+
+# --- --adopt shows the rule and asks -----------------------------------------
+
+reset_state
+enroll_one
+seed_foreign_rule "$sudo_pam"
+run "" enable no -- --adopt || true
+
+grep -qF "$FOREIGN_RULE" "$sudo_pam" ||
+  fail "adopt declined changes nothing" "$(cat "$sudo_pam")"
+pass "--adopt still leaves the rule alone when the answer is no"
+
+reset_state
+enroll_one
+seed_foreign_rule "$sudo_pam"
+run "" enable yes -- --adopt || true
+
+grep -qF "$FOREIGN_RULE" "$sudo_pam" &&
+  fail "adopt accepted replaces the rule" "$(cat "$sudo_pam")"
+grep -q 'cue_prompt' "$sudo_pam" ||
+  fail "adopt accepted writes our rule" "$(cat "$sudo_pam")"
+pass "--adopt replaces the rule once the user has said yes"
+
+[[ -n $(find "$etc/fido2/pam-backups" -name 'sudo.*' 2>/dev/null) ]] ||
+  fail "adopting backs the file up first" "$(ls -R "$etc/fido2" 2>&1)"
+pass "adopting backs the original file up first"
+
+# --- re-wiring an unchanged service writes nothing ---------------------------
+#
+# enroll re-wires on every run to keep the module line current. If that always
+# wrote the file, every enrollment would leave another dated backup behind.
+
+reset_state
+enroll_one
+run "" enable || true
+run "" enable || true
+
+(( $(find "$etc/fido2/pam-backups" -name 'sudo.*' 2>/dev/null | wc -l) <= 1 )) ||
+  fail "re-wiring an unchanged service does not rewrite it" "$(ls "$etc/fido2/pam-backups" 2>&1)"
+(( $(grep -c 'pam_u2f.so' "$sudo_pam") == 1 )) ||
+  fail "re-wiring an unchanged service does not stack a rule" "$(cat "$sudo_pam")"
+pass "re-wiring a service it already wired changes nothing"
+
+# --- the sudo cue prompt keeps its PAM bracket escape ------------------------
+#
+# pam.conf(5) ends a bracketed argument at the first unescaped "]", so the
+# literal "\]" in the sudo cue_prompt has to survive being written. It did not:
+# `awk -v` runs escape processing over its value and ate the backslash, leaving
+# PAM to read the argument as ending at "sudo" and to treat "touch", "your",
+# "security" and "key]" as four unknown module options.
+
+reset_state
+enroll_one
+run "" enable || true
+
+grep -qF 'cue_prompt=[sudo\] touch your security key' "$sudo_pam" ||
+  fail "the sudo cue prompt keeps its escaped bracket" "$(cat "$sudo_pam")"
+pass "the sudo cue prompt keeps its escaped bracket"
+
+# --- state tells the panel which rules are ours ------------------------------
+
+reset_state
+enroll_one
+seed_foreign_rule "$sudo_pam"
+run "" state || true
+
+jq -e '.wiring.sudo == false' "$output" >/dev/null ||
+  fail "a foreign rule is not reported as our wiring" "$(cat "$output")"
+jq -e '.foreignPam.sudo == true' "$output" >/dev/null ||
+  fail "a foreign rule is reported as foreign" "$(cat "$output")"
+pass "state distinguishes our wiring from somebody else's"
+
 # --- doctor reports every section it has ------------------------------------
 
 # A check whose last line was a plain `[[ ... ]] && warn ...` returned non-zero

@@ -38,6 +38,14 @@ still have the first — losing your only credential takes all three with it.
 `omarchy plugin remove erijl.lock` puts the built-in lock screen back. Run
 `bin/omarchy-fido2-suite disable` first if you also want PAM unwired.
 
+`/etc/pam.d/sudo` is not this plugin's file, so it only ever touches rules it
+wrote itself — each one marked with a comment naming the plugin. If a
+`pam_u2f` rule is already there from Omarchy's own *Setup › Security › Fido2*,
+from another tool, or from your own hand, `enable` leaves that service exactly
+as it is and says so; `disable` leaves it behind. `enable --adopt` takes such a
+rule over, after showing you the line it would replace and asking. Every edit
+to a shared PAM stack is backed up to `/etc/fido2/pam-backups/` first.
+
 ## Use it
 
 - **Panel** — click the key glyph on the bar, or `omarchy-shell shell summon
@@ -53,7 +61,7 @@ still have the first — losing your only credential takes all three with it.
 |---|---|
 | `enroll [label]` | register a key (only one attached at a time) |
 | `list` / `remove [n]` | what is enrolled; drop one credential |
-| `enable` / `disable` | wire the key into `sudo` and polkit, or unwire it |
+| `enable` / `disable` | wire the key into `sudo` and polkit, or unwire it (`--adopt` to take over a `pam_u2f` rule written by something else) |
 | `ssh [name] [--resident]` | mint an SSH key held on the authenticator |
 | `repair` | fix an installation the stock Omarchy flow made |
 | `status` / `doctor` | where things stand; check every link in the chain |

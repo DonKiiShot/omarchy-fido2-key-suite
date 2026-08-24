@@ -9,6 +9,10 @@ Item {
 
   property string label: ""
   property bool wired: false
+  // A pam_u2f rule somebody else wrote. Not ours to remove, so it is neither
+  // "wired" (which would claim credit and imply disable can undo it) nor
+  // "not wired" (which would be a lie about what unlocks this service).
+  property bool foreign: false
   property color foreground: Color.foreground
   property color dim: Qt.darker(Color.foreground, 1.5)
   property color accent: Color.accent
@@ -25,7 +29,7 @@ Item {
       textFormat: Text.PlainText
       // U+F00C check / U+F00D times, written as escapes: these are Private
       // Use Area codepoints and do not survive every round trip as literals.
-      text: root.wired ? "\uf00c" : "\uf00d"
+      text: root.wired ? "\uf00c" : (root.foreign ? "\uf128" : "\uf00d")
       color: root.wired ? root.accent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -45,7 +49,7 @@ Item {
 
     Text {
       textFormat: Text.PlainText
-      text: root.wired ? "" : "not wired"
+      text: root.foreign ? "wired by something else" : "not wired"
       visible: !root.wired
       color: root.dim
       font.family: root.fontFamily

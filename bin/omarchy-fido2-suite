@@ -10,7 +10,7 @@
 # Wiring:
 #   setup           write /etc/pam.d/omarchy-lock-fido2 (lock screen only)
 #   enable          wire the key into sudo, polkit and the lock screen
-#   disable         unwire PAM everywhere, keeping enrollments
+#   disable         remove this suite's PAM rules, keeping enrollments
 #   repair          fix an installation the stock Omarchy flow already made
 #
 # Health:
@@ -31,6 +31,14 @@ PAM_SERVICE="/etc/pam.d/omarchy-lock-fido2"
 AUTHFILE="/etc/fido2/fido2"
 METAFILE="/etc/fido2/tokens"
 PAM_WIRED_SERVICES=(sudo polkit-1)
+# Written above every rule this suite adds to a shared PAM stack, so ownership
+# is recorded in the file rather than inferred from the rule text. See
+# pam_foreign_lines().
+PAM_MARKER_TOKEN="omarchy-fido2-suite:managed"
+# Deliberately not inside /etc/pam.d: a stray file there is only ever read as
+# the service its name spells, but leaving "sudo.bak" next to "sudo" is a
+# footgun nobody needs.
+PAM_BACKUP_DIR="/etc/fido2/pam-backups"
 PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 OMARCHY_LOCK_DIR="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/lock"
 UPSTREAM_FILES=(Service.qml LockView.qml manifest.json)
@@ -39,6 +47,7 @@ USER_NAME=${SUDO_USER:-$USER}
 
 ASSUME_YES=0
 FORCE=0
+ADOPT=0
 RESIDENT=0
 FAILURES=0
 
@@ -133,6 +142,16 @@ sanitize_field() {
   local LC_ALL=C s=$1
   s=${s//[$'\001'-$'\037'$'\177']/}
   printf '%s' "${s:0:$MAX_FIELD_CHARS}"
+}
+
+# The same treatment for a whole config line we are about to echo back at the
+# user. /etc/pam.d is root-owned, so this is not the device case -- but a line
+# we did not write is still a line we did not write, and it gets quoted at a
+# terminal, so it goes through the same door.
+sanitize_line() {
+  local LC_ALL=C s=$1
+  s=${s//[$'\001'-$'\037'$'\177']/}
+  printf '%s' "${s:0:200}"
 }
 
 # Devices are listed as "/dev/hidrawN: vendor=... (Product Name)".
@@ -309,32 +328,126 @@ PAM
 
 # Insert above the first real auth rule rather than blindly at line 1, so the
 # "#%PAM-1.0" header keeps its place and the file still reads top-down.
-insert_pam_line() {
-  local file=$1 line=$2 tmp
-  tmp=$(mktemp)
-  awk -v line="$line" '
-    !done && /^[[:space:]]*auth[[:space:]]/ { print line; done = 1 }
+#
+# The marker goes in with the rule, as one block, so ownership survives in the
+# file. FIDO2_LINE and FIDO2_MARKER travel through the environment: `awk -v`
+# runs escape processing over its value, and PAM's bracket convention needs a
+# literal "\]" inside the sudo cue_prompt. Passed with -v, awk ate the
+# backslash and wrote "[cue_prompt=[sudo] touch your security key]", which
+# pam.conf(5) reads as ending the argument at "sudo" and leaves "touch",
+# "your", "security" and "key]" as four unknown module options.
+# Takes and returns content rather than editing in place, so the caller can
+# compare the result with what is on disk and write only when it differs.
+insert_pam_line() { # content line -> content, with our marked rule inserted
+  local content=$1 line=$2
+  FIDO2_LINE="$line" FIDO2_MARKER="$(pam_marker)" awk '
+    BEGIN { line = ENVIRON["FIDO2_LINE"]; marker = ENVIRON["FIDO2_MARKER"] }
+    !done && /^[[:space:]]*auth[[:space:]]/ { print marker; print line; done = 1 }
     { print }
-    END { if (!done) print line }
-  ' "$file" >"$tmp"
-  sudo install -o root -g root -m 0644 "$tmp" "$file"
-  rm -f "$tmp"
+    END { if (!done) { print marker; print line } }
+  ' <<<"$content"
 }
 
-strip_pam_line() {
-  local file=$1
+pam_marker() {
+  echo "# $PAM_MARKER_TOKEN ($PLUGIN_ID) -- added by 'omarchy-fido2-suite enable', removed by 'disable'"
+}
+
+# Which pam_u2f rules in a shared stack are ours.
+#
+# /etc/pam.d/sudo is not this plugin's file. Omarchy's own Setup > Security >
+# Fido2 writes a rule there, so does pam-u2f's documentation, so do people by
+# hand. Deleting every line that mentions pam_u2f.so -- which is what this used
+# to do -- erases whichever of those it finds, and rewriting it as our own
+# `sufficient` rule turns somebody's `required` second factor into a single
+# touch that grants root. Neither is ours to decide.
+#
+# So ownership is written down, not guessed: a marker comment immediately above
+# each rule we add. Two things count as ours, and nothing else ever does:
+#
+#   - a rule directly under our marker
+#   - a rule byte-identical to what pam_line() writes for that service, which
+#     is what versions before the marker existed left behind. Without this an
+#     upgraded install would keep a `sufficient` rule that `disable` could no
+#     longer remove -- a worse outcome than the bug being fixed. Byte-identical
+#     to our own output is ours by construction; it cannot match a foreign rule
+#     without already being the exact rule we would have written.
+#
+# FIDO2_MINE travels through the environment rather than `awk -v`, which runs
+# escape processing over the value and would mangle the "\]" that PAM's bracket
+# convention puts in the sudo cue_prompt.
+pam_foreign_lines() { # file service -> the pam_u2f lines we do not own
+  local file=$1 service=$2
   [[ -f $file ]] || return 0
-  grep -q 'pam_u2f\.so' "$file" || return 0
-  sudo sed -i '/pam_u2f\.so/d' "$file"
+  FIDO2_MINE="$(pam_line "$service")" awk -v marker="$PAM_MARKER_TOKEN" '
+    BEGIN { mine = ENVIRON["FIDO2_MINE"] }
+    index($0, marker) { pending = 1; next }
+    /pam_u2f\.so/ {
+      if (pending) { pending = 0; next }
+      if ($0 == mine) next
+      print; next
+    }
+    { pending = 0 }
+  ' "$file"
 }
 
-pam_wired() { [[ -f $(pam_path "$1") ]] && grep -q 'pam_u2f\.so' "$(pam_path "$1")"; }
+pam_without_ours() { # file service -> the file, minus our marker and our rules
+  local file=$1 service=$2
+  FIDO2_MINE="$(pam_line "$service")" awk -v marker="$PAM_MARKER_TOKEN" '
+    BEGIN { mine = ENVIRON["FIDO2_MINE"] }
+    index($0, marker) { pending = 1; next }
+    /pam_u2f\.so/ {
+      if (pending) { pending = 0; next }
+      if ($0 == mine) next
+      print; next
+    }
+    { pending = 0; print }
+  ' "$file"
+}
+
+# Locking yourself out of sudo is the failure mode here, so every edit to a
+# shared stack leaves a copy behind first. Mode 0600: a PAM stack is not
+# secret, but a pile of dated copies of one is worth nobody's browsing.
+backup_pam_file() {
+  local file=$1 dest
+  [[ -f $file ]] || return 0
+  dest="$PAM_BACKUP_DIR/$(basename "$file").$(date +%Y%m%d-%H%M%S)"
+  sudo mkdir -p "$PAM_BACKUP_DIR"
+  sudo install -o root -g root -m 0600 "$file" "$dest"
+  note "backed up $file -> $dest"
+}
+
+# Remove only our own rules. A file with none of ours is left byte-for-byte
+# alone, so `disable` on a machine wired by another tool is a no-op there
+# rather than a deletion.
+strip_pam_line() {
+  local file=$1 service=$2 stripped
+  [[ -f $file ]] || return 0
+  stripped=$(pam_without_ours "$file" "$service")
+  [[ $stripped == "$(cat "$file")" ]] && return 0
+  backup_pam_file "$file"
+  install_root_file "$stripped" "$file"
+}
+
+# "Wired" means wired by us. A foreign pam_u2f rule is reported separately
+# rather than counted here: it is not something `disable` can turn off, and
+# showing it as our wiring is what made enroll skip its own consent prompt.
+pam_wired() {
+  local file
+  file=$(pam_path "$1")
+  [[ -f $file ]] || return 1
+  [[ "$(pam_without_ours "$file" "$1")" != "$(cat "$file")" ]]
+}
+
+pam_has_foreign() { [[ -n $(pam_foreign_lines "$(pam_path "$1")" "$1") ]]; }
 lock_wired() { [[ -f $PAM_SERVICE ]] && grep -q 'pam_u2f\.so' "$PAM_SERVICE"; }
 
 write_lock_service() { install_root_file "$(pam_service_body)" "$PAM_SERVICE"; }
 
+# Returns non-zero if any service was left alone because somebody else's rule
+# is in it, so callers can report that rather than claim a wiring they did not
+# make.
 wire_system_pam() { # sudo and polkit; the lock service is written separately
-  local service file
+  local service file foreign line base new skipped=0
   for service in "${PAM_WIRED_SERVICES[@]}"; do
     file=$(pam_path "$service")
 
@@ -343,6 +456,7 @@ wire_system_pam() { # sudo and polkit; the lock service is written separately
       # stock setup script does.
       install_root_file "$(
         cat <<EOF
+$(pam_marker)
 $(pam_line "$service")
 auth       required    pam_unix.so
 
@@ -354,17 +468,77 @@ EOF
       continue
     fi
 
-    strip_pam_line "$file"
-    insert_pam_line "$file" "$(pam_line "$service")"
+    foreign=$(pam_foreign_lines "$file" "$service")
+    if [[ -n $foreign ]] && (( ! ADOPT )); then
+      skipped=1
+      warn "$file already has a pam_u2f rule this suite did not write -- leaving $service alone"
+      while IFS= read -r line; do
+        [[ -n $line ]] && note "  $(sanitize_line "$line")"
+      done <<<"$foreign"
+      note "that rule keeps working exactly as it is. To let this suite take it over:"
+      note "  $0 enable --adopt"
+      continue
+    fi
+
+    if [[ -n $foreign ]]; then
+      # --adopt: still not silent. Show what goes, show what arrives, ask.
+      echo
+      warn "$file has a pam_u2f rule this suite did not write:"
+      while IFS= read -r line; do
+        [[ -n $line ]] && echo "  - $(sanitize_line "$line")"
+      done <<<"$foreign"
+      echo "  + $(pam_line "$service")"
+      echo
+      if ! confirm "Replace it in $file?"; then
+        skipped=1
+        note "left $service alone"
+        continue
+      fi
+      base=$(pam_foreign_removed "$file" "$service")
+    else
+      base=$(cat "$file")
+    fi
+
+    # One write per service, and only when the result actually differs from
+    # what is there: enroll re-wires on every run to keep the module line
+    # current, and that must not pile up a backup each time.
+    new=$(insert_pam_line "$(pam_without_ours <(printf '%s\n' "$base") "$service")" "$(pam_line "$service")")
+    if [[ $new != "$(cat "$file")" ]]; then
+      backup_pam_file "$file"
+      install_root_file "$new" "$file"
+    fi
   done
+  return "$skipped"
+}
+
+# Only reached under --adopt, and only after the user has seen the lines and
+# said yes.
+pam_foreign_removed() { # file service -> the file, minus the foreign pam_u2f rules
+  local file=$1 service=$2
+  FIDO2_MINE="$(pam_line "$service")" awk -v marker="$PAM_MARKER_TOKEN" '
+    BEGIN { mine = ENVIRON["FIDO2_MINE"] }
+    index($0, marker) { pending = 1; print; next }
+    /pam_u2f\.so/ {
+      if (pending) { pending = 0; print; next }
+      if ($0 == mine) { print; next }
+      next
+    }
+    { pending = 0; print }
+  ' "$file"
 }
 
 unwire_all_pam() {
-  local service
+  local service left=0
   for service in "${PAM_WIRED_SERVICES[@]}"; do
-    strip_pam_line "$(pam_path "$service")"
+    strip_pam_line "$(pam_path "$service")" "$service"
+    if pam_has_foreign "$service"; then
+      left=1
+      warn "$(pam_path "$service") still has a pam_u2f rule this suite did not write; left as it is"
+    fi
   done
+  # Our own file, so it goes whole.
   sudo rm -f "$PAM_SERVICE"
+  return "$left"
 }
 
 # --------------------------------------------------------------- credentials
@@ -454,12 +628,16 @@ cmd_enroll() {
 
   # The lock screen is this plugin's job, so its PAM service is always kept
   # current. sudo and polkit are the user's call, asked once -- rewiring what
-  # is already wired keeps the module line in sync without asking again.
+  # we already wired keeps the module line in sync without asking again.
+  #
+  # "Already wired" has to mean wired by us. It used to mean any pam_u2f rule
+  # at all, so a rule another tool wrote counted as consent this suite had
+  # never been given, and enroll rewrote it without ever showing the prompt.
   write_lock_service
   if pam_wired sudo || pam_wired polkit-1; then
-    wire_system_pam
+    wire_system_pam || true
   elif confirm "Also protect sudo and polkit with the key?"; then
-    wire_system_pam
+    wire_system_pam || true
   fi
 
   echo
@@ -547,7 +725,7 @@ cmd_remove_credential() {
     else
       sudo rm -f "$AUTHFILE"
     fi
-    unwire_all_pam
+    unwire_all_pam || true
     ok "removed -- FIDO2 authentication is now off; password only"
   else
     write_mapfile "${USER_NAME}$(printf '%s' "${kept[@]}")"
@@ -603,13 +781,22 @@ cmd_setup() {
 cmd_enable() {
   (( $(credential_count) > 0 )) || fail "no keys enrolled -- run: $0 enroll"
   write_lock_service
-  wire_system_pam
-  ok "FIDO2 wired into sudo, polkit and the lock screen"
+  if wire_system_pam; then
+    ok "FIDO2 wired into sudo, polkit and the lock screen"
+  else
+    ok "FIDO2 wired into the lock screen"
+    warn "one or more system services were left as they are (see above)"
+  fi
 }
 
 cmd_disable() {
-  unwire_all_pam
-  ok "FIDO2 removed from sudo, polkit and the lock screen"
+  if unwire_all_pam; then
+    ok "FIDO2 removed from sudo, polkit and the lock screen"
+  else
+    ok "this suite's rules removed from sudo, polkit and the lock screen"
+    warn "a pam_u2f rule written by something else is still there (see above)"
+    note "it is not ours to remove -- edit the file by hand if you want it gone"
+  fi
   note "enrolled credentials are kept in $AUTHFILE; re-enable with: $0 enable"
   echo
   echo "The plugin itself is separate:"
@@ -631,8 +818,16 @@ cmd_repair() {
   fi
 
   write_lock_service
-  wire_system_pam
-  ok "PAM services rewired"
+  # Taking over a stock installation is what repair is for, so it adopts --
+  # but adopting still shows the rule it would replace and asks first. The
+  # point of repair is that the user asked for it, not that it is silent.
+  ADOPT=1
+  if wire_system_pam; then
+    ok "PAM services rewired"
+  else
+    ok "lock screen service rewired"
+    warn "one or more system services were left as they are (see above)"
+  fi
 
   # A credential registered by the stock script carries "+presence" alone. On
   # an authenticator that mandates UV, that credential can never assert, and no
@@ -754,6 +949,8 @@ cmd_status() {
   for service in "${PAM_WIRED_SERVICES[@]}"; do
     if pam_wired "$service"; then
       printf '  %-22s wired\n' "$service"
+    elif pam_has_foreign "$service"; then
+      printf '  %-22s %swired by something else%s\n' "$service" "$DIM" "$RESET"
     else
       printf '  %-22s %snot wired%s\n' "$service" "$DIM" "$RESET"
     fi
@@ -842,13 +1039,16 @@ cmd_state() {
     --argjson lock "$(lock_wired && echo true || echo false)" \
     --argjson sudo "$(pam_wired sudo && echo true || echo false)" \
     --argjson polkit "$(pam_wired polkit-1 && echo true || echo false)" \
+    --argjson sudoForeign "$(pam_has_foreign sudo && echo true || echo false)" \
+    --argjson polkitForeign "$(pam_has_foreign polkit-1 && echo true || echo false)" \
     '{user: $user, credentials: $credentials, tokens: $tokens,
       authfileOwner: $authfileOwner,
       counts: {credentials: $credentialsTotal, tokens: $tokensTotal},
       limits: {credentials: $maxCredentials, tokens: $maxTokens},
       truncated: {credentials: ($credentialsTotal > $maxCredentials),
                   tokens: ($tokensTotal > $maxTokens)},
-      wiring: {lockScreen: $lock, sudo: $sudo, polkit: $polkit}}'
+      wiring: {lockScreen: $lock, sudo: $sudo, polkit: $polkit},
+      foreignPam: {sudo: $sudoForeign, polkit: $polkitForeign}}'
 }
 
 # ------------------------------------------------------------------- doctor
@@ -894,6 +1094,9 @@ check_pam() {
   for service in "${PAM_WIRED_SERVICES[@]}"; do
     if pam_wired "$service"; then
       ok "$service is wired"
+    elif pam_has_foreign "$service"; then
+      warn "$service has a pam_u2f rule this suite did not write"
+      note "left alone on purpose; 'enable' will not touch it. To take it over: $0 enable --adopt"
     else
       warn "$service is not wired for the key"
       note "$0 enable"
@@ -1237,7 +1440,7 @@ cmd_rebase() {
 
 usage() {
   cat <<USAGE
-Usage: omarchy-fido2-suite <command> [--yes] [--force] [--resident]
+Usage: omarchy-fido2-suite <command> [--yes] [--force] [--adopt] [--resident]
 
 Credentials
   enroll [label]  enroll a security key (only one may be attached)
@@ -1250,7 +1453,9 @@ SSH
 Wiring
   setup           write $PAM_SERVICE (lock screen only; asks for sudo)
   enable          wire the key into sudo, polkit and the lock screen
-  disable         unwire PAM everywhere, keeping enrollments
+                  (--adopt to take over a pam_u2f rule written by something
+                  else, after showing it to you and asking)
+  disable         remove this suite's PAM rules, keeping enrollments
   repair          fix an installation the stock Omarchy flow already made
 
 Health
@@ -1271,6 +1476,7 @@ while (( $# > 0 )); do
   enroll | list | remove | ssh | setup | enable | disable | repair | status | doctor | state | detect | rebase) command="$1"; shift ;;
   --yes | -y) ASSUME_YES=1; shift ;;
   --force) FORCE=1; shift ;;
+  --adopt) ADOPT=1; shift ;;
   --resident) RESIDENT=1; shift ;;
   -h | --help) usage; exit 0 ;;
   *)
