@@ -43,8 +43,13 @@ wrote itself — each one marked with a comment naming the plugin. If a
 `pam_u2f` rule is already there from Omarchy's own *Setup › Security › Fido2*,
 from another tool, or from your own hand, `enable` leaves that service exactly
 as it is and says so; `disable` leaves it behind. `enable --adopt` takes such a
-rule over, after showing you the line it would replace and asking. Every edit
-to a shared PAM stack is backed up to `/etc/fido2/pam-backups/` first.
+rule over, after showing you the line it would replace and asking.
+
+The lock screen's own service, `/etc/pam.d/omarchy-lock-fido2`, is treated the
+same way: the stock Omarchy FIDO2 recipe creates that file too, so a copy this
+suite did not write gets a diff and a question before it is replaced, and
+`disable` leaves it where it found it. Every edit to a PAM file is backed up to
+`/etc/fido2/pam-backups/` first.
 
 ## Use it
 

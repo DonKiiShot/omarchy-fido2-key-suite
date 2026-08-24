@@ -308,6 +308,7 @@ pam_module_path() {
 pam_service_body() {
   cat <<PAM
 #%PAM-1.0
+# $PAM_MARKER_TOKEN ($PLUGIN_ID) -- written by omarchy-fido2-suite
 # Security-key unlock for the Omarchy lock screen (plugin: erijl.lock).
 #
 # Its own service on purpose. Adding \`sufficient pam_u2f.so\` to
@@ -441,7 +442,51 @@ pam_wired() {
 pam_has_foreign() { [[ -n $(pam_foreign_lines "$(pam_path "$1")" "$1") ]]; }
 lock_wired() { [[ -f $PAM_SERVICE ]] && grep -q 'pam_u2f\.so' "$PAM_SERVICE"; }
 
-write_lock_service() { install_root_file "$(pam_service_body)" "$PAM_SERVICE"; }
+lock_service_is_ours() {
+  [[ -f $PAM_SERVICE ]] || return 1
+  grep -qF "$PAM_MARKER_TOKEN" "$PAM_SERVICE" && return 0
+  # Versions before the marker put this in the body, and nothing else does.
+  grep -qF "(plugin: $PLUGIN_ID)" "$PAM_SERVICE"
+}
+
+# enroll, enable and repair all call this to keep the lock service current, and
+# "current" used to mean overwriting whatever was there -- no diff, no
+# question, no copy kept -- while `setup`, writing the same file, showed a diff
+# and asked. /etc/pam.d/omarchy-lock-fido2 is a service the stock Omarchy FIDO2
+# recipe also creates, so that file is not always ours to replace.
+#
+# Same rule as the shared stacks: ours is overwritten freely, anything else
+# gets a diff and a question. Returns non-zero when it left the file alone.
+write_lock_service() {
+  local wanted
+  wanted=$(pam_service_body)
+
+  if [[ ! -f $PAM_SERVICE ]]; then
+    install_root_file "$wanted" "$PAM_SERVICE"
+    return 0
+  fi
+
+  # Idempotent: enroll rewrites on every run, and that must not pile up a
+  # backup each time.
+  [[ $wanted == "$(cat "$PAM_SERVICE")" ]] && return 0
+
+  if ! lock_service_is_ours && (( ! FORCE )); then
+    echo
+    warn "$PAM_SERVICE exists and was not written by this suite."
+    echo "  The difference from what this would write:"
+    echo
+    diff -u "$PAM_SERVICE" <(printf '%s\n' "$wanted") || true
+    echo
+    if ! confirm "Replace $PAM_SERVICE?"; then
+      note "left $PAM_SERVICE as it is"
+      note "replace it without the question: $0 setup --force"
+      return 1
+    fi
+  fi
+
+  backup_pam_file "$PAM_SERVICE"
+  install_root_file "$wanted" "$PAM_SERVICE"
+}
 
 # Returns non-zero if any service was left alone because somebody else's rule
 # is in it, so callers can report that rather than claim a wiring they did not
@@ -536,8 +581,15 @@ unwire_all_pam() {
       warn "$(pam_path "$service") still has a pam_u2f rule this suite did not write; left as it is"
     fi
   done
-  # Our own file, so it goes whole.
-  sudo rm -f "$PAM_SERVICE"
+  if [[ -f $PAM_SERVICE ]]; then
+    if lock_service_is_ours; then
+      backup_pam_file "$PAM_SERVICE"
+      sudo rm -f "$PAM_SERVICE"
+    else
+      left=1
+      warn "$PAM_SERVICE was not written by this suite; left as it is"
+    fi
+  fi
   return "$left"
 }
 
@@ -633,7 +685,7 @@ cmd_enroll() {
   # "Already wired" has to mean wired by us. It used to mean any pam_u2f rule
   # at all, so a rule another tool wrote counted as consent this suite had
   # never been given, and enroll rewrote it without ever showing the prompt.
-  write_lock_service
+  write_lock_service || warn "the lock screen cannot offer the key until $PAM_SERVICE is written"
   if pam_wired sudo || pam_wired polkit-1; then
     wire_system_pam || true
   elif confirm "Also protect sudo and polkit with the key?"; then
@@ -754,25 +806,13 @@ cmd_setup() {
   fi
   ok "pam_u2f.so found at $module"
 
-  if [[ -f $PAM_SERVICE ]]; then
-    if (( ! FORCE )) && grep -q 'pam_u2f\.so' "$PAM_SERVICE"; then
-      ok "$PAM_SERVICE already exists and loads pam_u2f"
-      note "rewrite it with: $0 setup --force"
-      echo
-      cmd_doctor
-      return
-    fi
-
-    echo "$PAM_SERVICE already exists. The difference from what this would write:"
-    echo
-    diff -u "$PAM_SERVICE" <(pam_service_body) || true
-    echo
-    confirm "Replace $PAM_SERVICE?" || fail "aborted"
+  # write_lock_service owns the diff-and-ask now, so setup, enroll, enable and
+  # repair all treat the file the same way.
+  if write_lock_service; then
+    ok "$PAM_SERVICE is current"
+  else
+    warn "$PAM_SERVICE was left as it is"
   fi
-
-  echo "Writing $PAM_SERVICE (this is the sudo prompt)..."
-  write_lock_service
-  ok "wrote $PAM_SERVICE"
 
   echo
   cmd_doctor
@@ -780,7 +820,7 @@ cmd_setup() {
 
 cmd_enable() {
   (( $(credential_count) > 0 )) || fail "no keys enrolled -- run: $0 enroll"
-  write_lock_service
+  write_lock_service || warn "the lock screen cannot offer the key until $PAM_SERVICE is written"
   if wire_system_pam; then
     ok "FIDO2 wired into sudo, polkit and the lock screen"
   else
@@ -817,7 +857,7 @@ cmd_repair() {
     install_root_file "$(cat "$AUTHFILE")" "$AUTHFILE"
   fi
 
-  write_lock_service
+  write_lock_service || warn "the lock screen cannot offer the key until $PAM_SERVICE is written"
   # Taking over a stock installation is what repair is for, so it adopts --
   # but adopting still shows the rule it would replace and asks first. The
   # point of repair is that the user asked for it, not that it is silent.
@@ -1452,6 +1492,7 @@ SSH
 
 Wiring
   setup           write $PAM_SERVICE (lock screen only; asks for sudo)
+                  (--force to replace it without the diff and the question)
   enable          wire the key into sudo, polkit and the lock screen
                   (--adopt to take over a pam_u2f rule written by something
                   else, after showing it to you and asking)

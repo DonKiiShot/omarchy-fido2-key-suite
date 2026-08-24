@@ -653,6 +653,120 @@ jq -e '.foreignPam.sudo == true' "$output" >/dev/null ||
   fail "a foreign rule is reported as foreign" "$(cat "$output")"
 pass "state distinguishes our wiring from somebody else's"
 
+# --- the lock service is a file the stock recipe also creates ----------------
+#
+# enroll, enable and repair kept /etc/pam.d/omarchy-lock-fido2 "current" by
+# overwriting it -- no diff, no question, no copy kept -- while `setup`, for
+# the same file, showed a diff and asked. The stock Omarchy FIDO2 recipe
+# creates that service too, so it is not always ours to replace.
+
+seed_foreign_lock_service() {
+  cat >"$lock_pam" <<'PAM'
+#%PAM-1.0
+# Written by hand, with a deliberately different authfile.
+auth       required    pam_u2f.so authfile=/etc/somewhere/else cue
+account    include     system-local-login
+PAM
+}
+
+reset_state
+seed_foreign_lock_service
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll no no -- "Daily"
+
+grep -q 'authfile=/etc/somewhere/else' "$lock_pam" ||
+  fail "enroll asks before replacing a lock service it did not write" "$(cat "$lock_pam")"
+pass "enroll leaves a lock service it did not write when the answer is no"
+
+grep -q "was not written by this suite" "$output" ||
+  fail "enroll says why it is asking" "$(cat "$output")"
+pass "enroll shows the file it would replace and says it is not ours"
+
+reset_state
+seed_foreign_lock_service
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll yes no -- "Daily"
+
+grep -q 'authfile=/etc/somewhere/else' "$lock_pam" &&
+  fail "saying yes replaces the lock service" "$(cat "$lock_pam")"
+grep -q 'cue_prompt=Touch your security key' "$lock_pam" ||
+  fail "saying yes writes ours" "$(cat "$lock_pam")"
+pass "enroll replaces a foreign lock service once the user has said yes"
+
+[[ -n $(find "$etc/fido2/pam-backups" -name 'omarchy-lock-fido2.*' 2>/dev/null) ]] ||
+  fail "replacing the lock service backs it up first" "$(ls -R "$etc/fido2" 2>&1)"
+pass "replacing the lock service backs the original up first"
+
+# --- a service from an older version of this suite is still ours -------------
+
+reset_state
+attach_keys "Daily Key"
+describe_key "rk, up, alwaysUv, clientPin"
+cat >"$lock_pam" <<'PAM'
+#%PAM-1.0
+# Security-key unlock for the Omarchy lock screen (plugin: erijl.lock).
+auth       required    pam_u2f.so authfile=/etc/fido2/fido2 cue [cue_prompt=Touch your security key]
+account    include     system-local-login
+PAM
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAA enroll no -- "Daily"
+
+grep -q '^gum confirm' "$calls" && [[ $(grep -c '^gum confirm' "$calls") -gt 1 ]] &&
+  fail "an older version's own service is updated without a question" "$(cat "$calls")"
+grep -qF 'omarchy-fido2-suite:managed' "$lock_pam" ||
+  fail "an older version's own service is brought up to date" "$(cat "$lock_pam")"
+pass "a lock service written by an older version is updated without asking"
+
+# --- setup, enroll and enable all treat the file the same way ----------------
+
+reset_state
+seed_foreign_lock_service
+run "" setup no || true
+
+grep -q 'authfile=/etc/somewhere/else' "$lock_pam" ||
+  fail "setup still asks before replacing" "$(cat "$lock_pam")"
+pass "setup still asks before replacing a service it did not write"
+
+reset_state
+seed_foreign_lock_service
+run "" setup -- --force || true
+
+grep -q 'authfile=/etc/somewhere/else' "$lock_pam" &&
+  fail "setup --force replaces without asking" "$(cat "$lock_pam")"
+pass "setup --force replaces without asking, as it always did"
+
+# --- disable removes our service, not somebody else's ------------------------
+
+reset_state
+seed_foreign_lock_service
+run "" disable || true
+
+[[ -f $lock_pam ]] ||
+  fail "disable leaves a lock service it did not write" "$(cat "$output")"
+grep -q "was not written by this suite" "$output" ||
+  fail "disable says it left the lock service alone" "$(cat "$output")"
+pass "disable leaves a lock service it did not write"
+
+reset_state
+enroll_one
+run "" disable || true
+
+[[ -f $lock_pam ]] &&
+  fail "disable removes the service it wrote itself" "$(cat "$lock_pam")"
+pass "disable removes the lock service it wrote itself"
+
+# --- rewriting an unchanged service writes nothing ---------------------------
+
+reset_state
+enroll_one
+run "" enable || true
+run "" enable || true
+
+(( $(find "$etc/fido2/pam-backups" -name 'omarchy-lock-fido2.*' 2>/dev/null | wc -l) == 0 )) ||
+  fail "an unchanged lock service is not rewritten" "$(ls "$etc/fido2/pam-backups" 2>&1)"
+pass "an unchanged lock service is left alone rather than rewritten"
+
 # --- doctor reports every section it has ------------------------------------
 
 # A check whose last line was a plain `[[ ... ]] && warn ...` returned non-zero
